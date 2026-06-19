@@ -32,9 +32,19 @@ function escapeHtml(text: string): string {
 }
 
 /**
+ * Renumber every NCX `playOrder` sequentially (1, 2, 3, …). jepub can emit
+ * duplicate values, which EPUB 2 forbids unless they point to the same target
+ * (epubcheck RSC-005). Sequential unique values are always valid.
+ */
+function fixNcxPlayOrder(xml: string): string {
+  let n = 0
+  return xml.replace(/playOrder="\d+"/g, () => `playOrder="${++n}"`)
+}
+
+/**
  * Rebuild an EPUB zip so the `mimetype` entry is first and STORED (uncompressed),
- * as required by the OCF spec. jepub/JSZip otherwise deflate it, which trips
- * epubcheck (PKG-007) and stricter readers like Send-to-Kindle.
+ * as required by the OCF spec, and fix the NCX play order. jepub/JSZip otherwise
+ * trip epubcheck (PKG-007 / RSC-005) and stricter readers like Send-to-Kindle.
  */
 async function normalizeOcf(epubBlob: Blob): Promise<Blob> {
   const src = await JSZip.loadAsync(epubBlob)
@@ -45,8 +55,13 @@ async function normalizeOcf(epubBlob: Blob): Promise<Blob> {
 
   for (const entry of Object.values(src.files)) {
     if (entry.dir || entry.name === "mimetype") continue
-    const data = await entry.async("uint8array")
-    out.file(entry.name, data, { compression: "DEFLATE" })
+    if (entry.name.toLowerCase().endsWith(".ncx")) {
+      const xml = await entry.async("string")
+      out.file(entry.name, fixNcxPlayOrder(xml), { compression: "DEFLATE" })
+    } else {
+      const data = await entry.async("uint8array")
+      out.file(entry.name, data, { compression: "DEFLATE" })
+    }
   }
 
   return out.generateAsync({
