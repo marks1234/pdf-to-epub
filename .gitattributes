@@ -1,0 +1,10 @@
+# Normalize line endings: store LF in the repo, check out native on Windows.
+* text=auto
+
+# Always LF for these regardless of platform.
+*.py text eol=lf
+*.sh text eol=lf
+
+# Treat binary artifacts as binary (no line-ending conversion, no diff).
+*.pdf binary
+*.epub binary
