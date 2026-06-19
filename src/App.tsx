@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react"
+import { Fragment, useCallback, useMemo, useState } from "react"
 import { useDropzone } from "react-dropzone"
 import {
   DndContext,
@@ -18,8 +18,10 @@ import {
 import {
   ArrowDownAZ,
   BookOpen,
+  CheckCircle2,
   Loader2,
   Merge,
+  TriangleAlert,
   Trash2,
   UploadCloud,
 } from "lucide-react"
@@ -35,6 +37,15 @@ import { cn } from "@/lib/utils"
 import { mergePdfs } from "@/lib/merge-pdf"
 import { pdfToEpub } from "@/lib/pdf-to-epub"
 import { downloadBlob } from "@/lib/download"
+import {
+  analyzeSequence,
+  extractNumber,
+  formatNumberRanges,
+  rangeBetween,
+} from "@/lib/sequence"
+
+/** Largest gap span we annotate inline; bigger gaps are only shown in the banner. */
+const MAX_INLINE_GAP = 26
 
 type Busy = "idle" | "merging" | "converting"
 
@@ -52,6 +63,11 @@ export default function App() {
   const [author, setAuthor] = useState("")
   const [busy, setBusy] = useState<Busy>("idle")
   const [error, setError] = useState<string | null>(null)
+
+  const seq = useMemo(
+    () => analyzeSequence(items.map((i) => i.file.name)),
+    [items],
+  )
 
   const sensors = useSensors(
     // A small distance threshold so clicks on the remove button aren't drags.
@@ -87,7 +103,15 @@ export default function App() {
   const removeItem = (id: string) =>
     setItems((prev) => prev.filter((i) => i.id !== id))
 
-  const autoOrder = () => setItems((prev) => [...prev].sort(byNaturalName))
+  const autoOrder = () =>
+    setItems((prev) =>
+      [...prev].sort((a, b) => {
+        const na = extractNumber(a.file.name).num
+        const nb = extractNumber(b.file.name).num
+        if (na !== null && nb !== null && na !== nb) return na - nb
+        return byNaturalName(a, b)
+      }),
+    )
 
   const clearAll = () => {
     setItems([])
@@ -216,6 +240,46 @@ export default function App() {
             </div>
           )}
 
+          {/* Sequence / gap detection */}
+          {seq.hasOrder &&
+            (seq.missing.length > 0 || seq.duplicates.length > 0 ? (
+              <div className="flex shrink-0 items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300">
+                <TriangleAlert className="mt-0.5 size-4 shrink-0" />
+                <div className="space-y-0.5">
+                  {seq.missing.length > 0 && (
+                    <p>
+                      Gap in sequence — missing{" "}
+                      {(seq.label ?? "number").toLowerCase()}
+                      {seq.missing.length > 1 ? "s" : ""}{" "}
+                      <span className="font-semibold">
+                        {formatNumberRanges(seq.missing)}
+                      </span>
+                      .
+                    </p>
+                  )}
+                  {seq.duplicates.length > 0 && (
+                    <p>
+                      Duplicate{" "}
+                      {(seq.label ?? "number").toLowerCase()}
+                      {seq.duplicates.length > 1 ? "s" : ""}:{" "}
+                      <span className="font-semibold">
+                        {formatNumberRanges(seq.duplicates)}
+                      </span>
+                      .
+                    </p>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div className="flex shrink-0 items-center gap-2 rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 text-sm text-emerald-800 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-300">
+                <CheckCircle2 className="size-4 shrink-0" />
+                <p>
+                  Sequence complete — {(seq.label ?? "items").toLowerCase()}{" "}
+                  {seq.min}–{seq.max}, no gaps.
+                </p>
+              </div>
+            ))}
+
           {/* Scrollable file list */}
           {hasFiles ? (
             <div className="min-h-0 flex-1 overflow-y-auto rounded-lg border">
@@ -229,15 +293,37 @@ export default function App() {
                   strategy={verticalListSortingStrategy}
                 >
                   <ul className="divide-y">
-                    {items.map((item, index) => (
-                      <SortableFileItem
-                        key={item.id}
-                        item={item}
-                        index={index}
-                        onRemove={removeItem}
-                        disabled={isBusy}
-                      />
-                    ))}
+                    {items.map((item, index) => {
+                      const cur = seq.numbers[index]
+                      const next = seq.numbers[index + 1]
+                      const gap =
+                        seq.hasOrder &&
+                        cur !== null &&
+                        next != null &&
+                        next - cur >= 2 &&
+                        next - cur <= MAX_INLINE_GAP
+                          ? rangeBetween(cur, next)
+                          : null
+
+                      return (
+                        <Fragment key={item.id}>
+                          <SortableFileItem
+                            item={item}
+                            index={index}
+                            onRemove={removeItem}
+                            disabled={isBusy}
+                          />
+                          {gap && (
+                            <li className="flex items-center justify-center gap-1.5 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-700 dark:bg-amber-950/40 dark:text-amber-400">
+                              <TriangleAlert className="size-3.5" />
+                              Missing {(seq.label ?? "number").toLowerCase()}
+                              {gap.length > 1 ? "s" : ""}{" "}
+                              {formatNumberRanges(gap)}
+                            </li>
+                          )}
+                        </Fragment>
+                      )
+                    })}
                   </ul>
                 </SortableContext>
               </DndContext>
