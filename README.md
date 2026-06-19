@@ -6,9 +6,12 @@ your device.
 
 ## Features
 
-- 📎 Merge any number of PDFs, reorder them before exporting
+- 📎 Merge any number of PDFs, drag to reorder, auto-order by chapter number
+- 🔎 Detects numeric sequences and flags missing/duplicate files (gaps)
 - 📖 Convert the merged PDF to EPUB (text-based, one chapter per page)
-- 💾 Download the merged PDF or the generated EPUB
+- 🗂️ Output history — generated files are saved on-device (IndexedDB) and
+  re-downloadable; keeps the last 50
+- 🧠 Remembers titles & authors you've used (localStorage); remove any with ×
 - 📱 Installable PWA with offline support
 
 ## Tech stack
@@ -67,3 +70,7 @@ npx shadcn@latest add <component>
   roadmap.
 - PWA icons currently use an SVG. For best install support on all platforms,
   generate raster icons with `npm run generate-pwa-assets` from a source image.
+- **Storage is local to the browser/device** and not synced. Output files live
+  in IndexedDB; remembered names in localStorage. The app requests persistent
+  storage to reduce the chance of eviction, but clearing browser data removes
+  everything.
