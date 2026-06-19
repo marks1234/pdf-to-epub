@@ -36,6 +36,28 @@ npm run preview  # preview the production build
 npm run lint     # run eslint
 ```
 
+## Deploy (GitHub Pages)
+
+The app is static — it builds to `dist/` and needs no server. A workflow at
+[.github/workflows/deploy.yml](.github/workflows/deploy.yml) builds and publishes
+it on every push to `main`.
+
+One-time setup:
+
+```bash
+# create the repo on GitHub and push (replace <user>)
+git remote add origin https://github.com/<user>/pdf-to-epub.git
+git push -u origin main
+```
+
+Then in the repo: **Settings → Pages → Build and deployment → Source = GitHub
+Actions**. The next push deploys to `https://<user>.github.io/pdf-to-epub/`,
+where it's installable as a PWA and works offline.
+
+> The production base path is `/pdf-to-epub/` (set in
+> [vite.config.ts](vite.config.ts)). If you rename the repo or use a custom
+> domain, update `BASE` there.
+
 ## Project structure
 
 ```
