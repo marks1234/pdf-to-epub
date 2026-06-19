@@ -167,9 +167,8 @@ export default function App() {
     setBusy("converting")
     try {
       const files = items.map((i) => i.file)
-      const bytes = await mergePdfs(files)
       const pages = await countPages(files)
-      const blob = await pdfToEpub(bytes, {
+      const blob = await pdfToEpub(files, {
         title: title || "Merged Document",
         author: author || "Unknown",
       })
