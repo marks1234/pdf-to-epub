@@ -6,6 +6,7 @@ import jEpub from "jepub"
 import JSZip from "jszip"
 
 import { extractNumber } from "@/lib/sequence"
+import { colorizeRarities, RARITY_CSS } from "@/lib/rarity"
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl
 
@@ -37,18 +38,95 @@ function isTextItem(item: unknown): item is TextItem {
   return typeof (item as TextItem).str === "string"
 }
 
+/** One assembled line of text plus the geometry used to merge or split it. */
+export interface ReconstructedLine {
+  y: number
+  height: number
+  text: string
+}
+
+/** A block of output: a list item (`li`) or a normal paragraph (`p`). */
+export interface Block {
+  type: "p" | "li"
+  text: string
+}
+
+// Bullet glyphs that mark a list item. A line beginning with one of these is a
+// hard line boundary (stat blocks / property lists are single-spaced, so a
+// vertical-gap test alone can't tell them apart from a wrapped prose line).
+const BULLET_RE = /^[•‣◦▪●∙]\s+/
+
 /**
- * Reconstruct readable paragraphs from pdf.js text items.
+ * Assemble reconstructed lines into output blocks.
+ *
+ * Most adjacent single-spaced lines are soft-wraps of one paragraph and get
+ * merged. But list-like content (e.g. a "stat block": bullets and short section
+ * labels) is also single-spaced, so a pure vertical-gap test would collapse it
+ * into one run-on paragraph. We therefore treat two extra signals as hard line
+ * boundaries:
+ *
+ *   - a line that starts with a bullet glyph (`•`) — a new list item;
+ *   - a non-bullet line that *follows* a bullet and isn't an obvious lowercase
+ *     wrap of it — a section label such as "Subsume Results".
+ *
+ * Pure and geometry-free so it can be unit-tested without pdf.js.
+ */
+export function assembleBlocks(lines: ReconstructedLine[]): Block[] {
+  const blocks: Block[] = []
+  let prevY: number | null = null
+  let prevHeight = 10
+  let prevWasBullet = false
+
+  for (const line of lines) {
+    const isBullet = BULLET_RE.test(line.text)
+    let startNewBlock: boolean
+
+    if (prevY === null) {
+      startNewBlock = true
+    } else if (isBullet) {
+      // Every bullet begins its own list item.
+      startNewBlock = true
+    } else if (prevWasBullet) {
+      // After a bullet, a line that looks like a lowercase continuation is a
+      // wrap of that bullet; anything else (a label, a new sentence) breaks.
+      const bigGap = prevY - line.y > prevHeight * 1.8
+      const looksLikeWrap = /^[a-z]/.test(line.text)
+      startNewBlock = bigGap || !looksLikeWrap
+    } else {
+      // Normal prose: only a large vertical gap starts a new paragraph.
+      startNewBlock = prevY - line.y > prevHeight * 1.8
+    }
+
+    if (startNewBlock) {
+      blocks.push({ type: isBullet ? "li" : "p", text: line.text })
+    } else {
+      const last = blocks[blocks.length - 1]
+      last.text = `${last.text} ${line.text}`
+    }
+
+    prevY = line.y
+    prevHeight = line.height
+    prevWasBullet = isBullet
+  }
+
+  // Strip the leading bullet glyph from list items; the EPUB renders the marker.
+  return blocks.map((b) =>
+    b.type === "li" ? { ...b, text: b.text.replace(BULLET_RE, "").trim() } : b,
+  )
+}
+
+/**
+ * Reconstruct readable blocks from pdf.js text items.
  *
  * pdf.js returns text in many sub-word fragments with absolute positions.
  * Naively joining them with spaces breaks words apart ("C h a pt e r") and
  * loses structure. Instead we group fragments into lines by their Y position,
- * insert a space only where there is a real horizontal gap, then join wrapped
- * lines into paragraphs, splitting on larger vertical gaps.
+ * insert a space only where there is a real horizontal gap, then assemble
+ * wrapped lines into paragraphs and bullet runs into list items.
  *
- * @returns Array of paragraph strings (plain text, unescaped).
+ * @returns Array of output blocks (plain text, unescaped).
  */
-function reconstructParagraphs(items: TextItem[]): string[] {
+function reconstructBlocks(items: TextItem[]): Block[] {
   const fragments = items.filter((it) => it.str.trim() !== "" || it.width > 0)
   if (fragments.length === 0) return []
 
@@ -74,7 +152,7 @@ function reconstructParagraphs(items: TextItem[]): string[] {
   // Top-to-bottom.
   lines.sort((a, b) => b.y - a.y)
 
-  const lineTexts = lines
+  const lineTexts: ReconstructedLine[] = lines
     .map((line) => {
       const sorted = [...line.items].sort(
         (a, b) => a.transform[4] - b.transform[4],
@@ -96,29 +174,7 @@ function reconstructParagraphs(items: TextItem[]): string[] {
     })
     .filter((l) => l.text)
 
-  // Join wrapped lines into paragraphs; a large vertical gap starts a new one.
-  const paragraphs: string[] = []
-  let current = ""
-  let prevY: number | null = null
-  let prevHeight = 10
-  for (const line of lineTexts) {
-    if (prevY === null) {
-      current = line.text
-    } else {
-      const gap = prevY - line.y
-      if (gap > prevHeight * 1.8) {
-        if (current) paragraphs.push(current)
-        current = line.text
-      } else {
-        current = current ? `${current} ${line.text}` : line.text
-      }
-    }
-    prevY = line.y
-    prevHeight = line.height
-  }
-  if (current) paragraphs.push(current)
-
-  return paragraphs
+  return assembleBlocks(lineTexts)
 }
 
 /** Derive a chapter title from a file name, e.g. "Chapter 22 (2,509 words).pdf" → "Chapter 22". */
@@ -145,10 +201,31 @@ function fixNcxPlayOrder(xml: string): string {
   return xml.replace(/playOrder="\d+"/g, () => `playOrder="${++n}"`)
 }
 
+// Where the rarity stylesheet lives in the EPUB. Pages sit in OEBPS/ and link it
+// by relative name; the OPF (book.opf, at the zip root) references it with the
+// OEBPS/ prefix. jepub ships no stylesheet, so we add and wire up our own.
+const STYLESHEET_PATH = "OEBPS/style.css"
+const STYLESHEET_HREF = "style.css"
+const STYLESHEET_MANIFEST_ITEM = `<item id="rarity-css" href="${STYLESHEET_PATH}" media-type="text/css" />`
+const STYLESHEET_LINK = `<link rel="stylesheet" type="text/css" href="${STYLESHEET_HREF}" />`
+
+/** Register the stylesheet in the OPF manifest (epubcheck requires every file declared). */
+function addCssToManifest(opf: string): string {
+  return opf.replace("</manifest>", `\t\t${STYLESHEET_MANIFEST_ITEM}\n\t</manifest>`)
+}
+
+/** Link the stylesheet from a page's `<head>` so its rules apply. */
+function linkCss(html: string): string {
+  return html.replace("</head>", `\t${STYLESHEET_LINK}\n</head>`)
+}
+
 /**
  * Rebuild an EPUB zip so the `mimetype` entry is first and STORED (uncompressed),
  * as required by the OCF spec, and fix the NCX play order. jepub/JSZip otherwise
  * trip epubcheck (PKG-007 / RSC-005) and stricter readers like Send-to-Kindle.
+ *
+ * Also injects the rarity stylesheet: writes OEBPS/style.css, declares it in the
+ * OPF manifest, and links it from every XHTML page.
  */
 async function normalizeOcf(epubBlob: Blob): Promise<Blob> {
   const src = await JSZip.loadAsync(epubBlob)
@@ -159,14 +236,23 @@ async function normalizeOcf(epubBlob: Blob): Promise<Blob> {
 
   for (const entry of Object.values(src.files)) {
     if (entry.dir || entry.name === "mimetype") continue
-    if (entry.name.toLowerCase().endsWith(".ncx")) {
+    const name = entry.name.toLowerCase()
+    if (name.endsWith(".ncx")) {
       const xml = await entry.async("string")
       out.file(entry.name, fixNcxPlayOrder(xml), { compression: "DEFLATE" })
+    } else if (name.endsWith(".opf")) {
+      const opf = await entry.async("string")
+      out.file(entry.name, addCssToManifest(opf), { compression: "DEFLATE" })
+    } else if (name.endsWith(".html") || name.endsWith(".xhtml")) {
+      const html = await entry.async("string")
+      out.file(entry.name, linkCss(html), { compression: "DEFLATE" })
     } else {
       const data = await entry.async("uint8array")
       out.file(entry.name, data, { compression: "DEFLATE" })
     }
   }
+
+  out.file(STYLESHEET_PATH, RARITY_CSS, { compression: "DEFLATE" })
 
   return out.generateAsync({
     type: "blob",
@@ -179,18 +265,46 @@ async function pdfFileToHtml(file: File): Promise<string> {
   const bytes = new Uint8Array(await file.arrayBuffer())
   const pdf = await pdfjsLib.getDocument({ data: bytes }).promise
 
-  const paragraphs: string[] = []
+  const blocks: Block[] = []
   for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
     const page = await pdf.getPage(pageNum)
     const content = await page.getTextContent()
     const items = content.items.filter(isTextItem)
-    paragraphs.push(...reconstructParagraphs(items))
+    blocks.push(...reconstructBlocks(items))
   }
 
-  if (paragraphs.length === 0) {
+  if (blocks.length === 0) {
     return "<p><em>(no extractable text — this PDF may be scanned images)</em></p>"
   }
-  return paragraphs.map((p) => `<p>${escapeHtml(p)}</p>`).join("\n")
+  return blocksToHtml(blocks)
+}
+
+/**
+ * Render blocks as HTML, wrapping each run of consecutive list items in a
+ * `<ul class="stat-block">`.
+ *
+ * Rarity/tier tags (`[Common]`, `[Legendary]`, …) are colorized ONLY inside list
+ * items — the stat-block content produced by `reconstructBlocks`. Paragraph
+ * blocks are ordinary prose and are escaped verbatim, so bracketed text in a
+ * narrative paragraph is never styled.
+ */
+export function blocksToHtml(blocks: Block[]): string {
+  const out: string[] = []
+  let i = 0
+  while (i < blocks.length) {
+    if (blocks[i].type === "li") {
+      const items: string[] = []
+      while (i < blocks.length && blocks[i].type === "li") {
+        items.push(`<li>${colorizeRarities(escapeHtml(blocks[i].text))}</li>`)
+        i++
+      }
+      out.push(`<ul class="stat-block">${items.join("")}</ul>`)
+    } else {
+      out.push(`<p>${escapeHtml(blocks[i].text)}</p>`)
+      i++
+    }
+  }
+  return out.join("\n")
 }
 
 /**
