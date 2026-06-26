@@ -44,5 +44,22 @@ export default defineConfig(({ command }) => {
         "@": path.resolve(__dirname, "./src"),
       },
     },
+    build: {
+      // jepub renders its templates through EJS with `client: true`. EJS embeds
+      // its escape helper into a runtime `new Function` via `escapeXML.toString()`,
+      // which appends the helper source as a STRING LITERAL with hardcoded names
+      // (`_MATCH_HTML`, `encode_char`, `_ENCODE_HTML_RULES`). esbuild's default
+      // minifier renames those identifiers in the function body but not in the
+      // string literal, so the generated function references a mangled name that
+      // doesn't exist → "a is not defined" at conversion time (prod only; dev is
+      // unminified). Use terser and reserve those names so body and literal stay
+      // in sync. Do NOT remove this without re-testing PDF→EPUB on a prod build.
+      minify: "terser",
+      terserOptions: {
+        mangle: {
+          reserved: ["_MATCH_HTML", "encode_char", "_ENCODE_HTML_RULES"],
+        },
+      },
+    },
   }
 })
