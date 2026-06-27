@@ -77,17 +77,19 @@ describe("assembleBlocks", () => {
     ])
   })
 
-  it("colorizes rarity tags inside stat-block list items only", () => {
+  it("boxes a run of stat list items and colorizes their rarity tags", () => {
     const blocks: Block[] = [
       { type: "li", text: "[Common] Switcher Core has been added to Arsenal." },
       { type: "li", text: "[Legendary] Blade of Dawn obtained." },
     ]
     const html = blocksToHtml(blocks)
     expect(html).toBe(
-      '<ul class="stat-block">' +
+      '<div class="stat-sheet">' +
+        '<ul class="stat-block">' +
         '<li><span class="rarity-common">[Common]</span> Switcher Core has been added to Arsenal.</li>' +
         '<li><span class="rarity-legendary">[Legendary]</span> Blade of Dawn obtained.</li>' +
-        "</ul>",
+        "</ul>" +
+        "</div>",
     )
   })
 

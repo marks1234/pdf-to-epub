@@ -6,9 +6,14 @@ import jEpub from "jepub"
 import JSZip from "jszip"
 
 import { extractNumber } from "@/lib/sequence"
-import { colorizeRarities, RARITY_CSS } from "@/lib/rarity"
+import { RARITY_CSS } from "@/lib/rarity"
+import { blocksToHtml, reconstructBlocks, type Block } from "@/lib/reconstruct"
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl
+
+// The reconstruction/render logic lives in reconstruct.ts; re-exported for tests.
+export type { Block, ReconstructedLine } from "@/lib/reconstruct"
+export { assembleBlocks, blocksToHtml } from "@/lib/reconstruct"
 
 export interface EpubMetadata {
   title: string
@@ -17,164 +22,8 @@ export interface EpubMetadata {
   description?: string
 }
 
-// Characters illegal in XML 1.0: control chars below 0x20 except tab/newline/CR,
-// plus the U+FFFE/U+FFFF non-characters. PDF text extraction occasionally emits
-// these, which would otherwise make the chapter XHTML not well-formed.
-// eslint-disable-next-line no-control-regex
-const INVALID_XML_CHARS = /[\x00-\x08\x0B\x0C\x0E-\x1F\uFFFE\uFFFF]/g
-
-function sanitize(text: string): string {
-  return text.replace(INVALID_XML_CHARS, "")
-}
-
-function escapeHtml(text: string): string {
-  return sanitize(text)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-}
-
 function isTextItem(item: unknown): item is TextItem {
   return typeof (item as TextItem).str === "string"
-}
-
-/** One assembled line of text plus the geometry used to merge or split it. */
-export interface ReconstructedLine {
-  y: number
-  height: number
-  text: string
-}
-
-/** A block of output: a list item (`li`) or a normal paragraph (`p`). */
-export interface Block {
-  type: "p" | "li"
-  text: string
-}
-
-// Bullet glyphs that mark a list item. A line beginning with one of these is a
-// hard line boundary (stat blocks / property lists are single-spaced, so a
-// vertical-gap test alone can't tell them apart from a wrapped prose line).
-const BULLET_RE = /^[•‣◦▪●∙]\s+/
-
-/**
- * Assemble reconstructed lines into output blocks.
- *
- * Most adjacent single-spaced lines are soft-wraps of one paragraph and get
- * merged. But list-like content (e.g. a "stat block": bullets and short section
- * labels) is also single-spaced, so a pure vertical-gap test would collapse it
- * into one run-on paragraph. We therefore treat two extra signals as hard line
- * boundaries:
- *
- *   - a line that starts with a bullet glyph (`•`) — a new list item;
- *   - a non-bullet line that *follows* a bullet and isn't an obvious lowercase
- *     wrap of it — a section label such as "Subsume Results".
- *
- * Pure and geometry-free so it can be unit-tested without pdf.js.
- */
-export function assembleBlocks(lines: ReconstructedLine[]): Block[] {
-  const blocks: Block[] = []
-  let prevY: number | null = null
-  let prevHeight = 10
-  let prevWasBullet = false
-
-  for (const line of lines) {
-    const isBullet = BULLET_RE.test(line.text)
-    let startNewBlock: boolean
-
-    if (prevY === null) {
-      startNewBlock = true
-    } else if (isBullet) {
-      // Every bullet begins its own list item.
-      startNewBlock = true
-    } else if (prevWasBullet) {
-      // After a bullet, a line that looks like a lowercase continuation is a
-      // wrap of that bullet; anything else (a label, a new sentence) breaks.
-      const bigGap = prevY - line.y > prevHeight * 1.8
-      const looksLikeWrap = /^[a-z]/.test(line.text)
-      startNewBlock = bigGap || !looksLikeWrap
-    } else {
-      // Normal prose: only a large vertical gap starts a new paragraph.
-      startNewBlock = prevY - line.y > prevHeight * 1.8
-    }
-
-    if (startNewBlock) {
-      blocks.push({ type: isBullet ? "li" : "p", text: line.text })
-    } else {
-      const last = blocks[blocks.length - 1]
-      last.text = `${last.text} ${line.text}`
-    }
-
-    prevY = line.y
-    prevHeight = line.height
-    prevWasBullet = isBullet
-  }
-
-  // Strip the leading bullet glyph from list items; the EPUB renders the marker.
-  return blocks.map((b) =>
-    b.type === "li" ? { ...b, text: b.text.replace(BULLET_RE, "").trim() } : b,
-  )
-}
-
-/**
- * Reconstruct readable blocks from pdf.js text items.
- *
- * pdf.js returns text in many sub-word fragments with absolute positions.
- * Naively joining them with spaces breaks words apart ("C h a pt e r") and
- * loses structure. Instead we group fragments into lines by their Y position,
- * insert a space only where there is a real horizontal gap, then assemble
- * wrapped lines into paragraphs and bullet runs into list items.
- *
- * @returns Array of output blocks (plain text, unescaped).
- */
-function reconstructBlocks(items: TextItem[]): Block[] {
-  const fragments = items.filter((it) => it.str.trim() !== "" || it.width > 0)
-  if (fragments.length === 0) return []
-
-  // Group fragments into lines by baseline Y (PDF Y grows upward).
-  interface Line {
-    y: number
-    height: number
-    items: TextItem[]
-  }
-  const lines: Line[] = []
-  for (const it of fragments) {
-    const y = it.transform[5]
-    const h = it.height || 10
-    const line = lines.find((l) => Math.abs(l.y - y) <= Math.max(l.height, h) * 0.5)
-    if (line) {
-      line.items.push(it)
-      line.height = Math.max(line.height, h)
-    } else {
-      lines.push({ y, height: h, items: [it] })
-    }
-  }
-
-  // Top-to-bottom.
-  lines.sort((a, b) => b.y - a.y)
-
-  const lineTexts: ReconstructedLine[] = lines
-    .map((line) => {
-      const sorted = [...line.items].sort(
-        (a, b) => a.transform[4] - b.transform[4],
-      )
-      let text = ""
-      let prevEndX: number | null = null
-      for (const it of sorted) {
-        const x = it.transform[4]
-        const w = it.width || 0
-        const h = it.height || line.height
-        if (prevEndX !== null) {
-          const gap = x - prevEndX
-          if (gap > h * 0.25 && !text.endsWith(" ")) text += " "
-        }
-        text += it.str
-        prevEndX = x + w
-      }
-      return { y: line.y, height: line.height, text: text.replace(/\s+/g, " ").trim() }
-    })
-    .filter((l) => l.text)
-
-  return assembleBlocks(lineTexts)
 }
 
 /** Derive a chapter title from a file name, e.g. "Chapter 22 (2,509 words).pdf" → "Chapter 22". */
@@ -277,34 +126,6 @@ async function pdfFileToHtml(file: File): Promise<string> {
     return "<p><em>(no extractable text — this PDF may be scanned images)</em></p>"
   }
   return blocksToHtml(blocks)
-}
-
-/**
- * Render blocks as HTML, wrapping each run of consecutive list items in a
- * `<ul class="stat-block">`.
- *
- * Rarity/tier tags (`[Common]`, `[Legendary]`, …) are colorized ONLY inside list
- * items — the stat-block content produced by `reconstructBlocks`. Paragraph
- * blocks are ordinary prose and are escaped verbatim, so bracketed text in a
- * narrative paragraph is never styled.
- */
-export function blocksToHtml(blocks: Block[]): string {
-  const out: string[] = []
-  let i = 0
-  while (i < blocks.length) {
-    if (blocks[i].type === "li") {
-      const items: string[] = []
-      while (i < blocks.length && blocks[i].type === "li") {
-        items.push(`<li>${colorizeRarities(escapeHtml(blocks[i].text))}</li>`)
-        i++
-      }
-      out.push(`<ul class="stat-block">${items.join("")}</ul>`)
-    } else {
-      out.push(`<p>${escapeHtml(blocks[i].text)}</p>`)
-      i++
-    }
-  }
-  return out.join("\n")
 }
 
 /**

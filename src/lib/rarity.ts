@@ -175,8 +175,22 @@ export const RARITY_LOOKUP: Map<string, string> = new Map(
 
 /** Base stat-block styling plus one rule per rarity tier — embedded in the EPUB. */
 export const RARITY_CSS: string = [
-  ".stat-block{margin:0.5em 0;padding-left:1.5em;list-style:disc;}",
-  ".stat-block li{margin:0.15em 0;}",
+  // Stat-sheet panel: a bordered, tinted box that reads as a game UI readout and
+  // stays legible on both light and dark backgrounds (uses currentColor + a faint
+  // neutral tint rather than fixed colors).
+  ".stat-sheet{margin:1em 0;padding:0.55em 0.85em;border:1px solid currentColor;" +
+    "border-radius:8px;background:rgba(128,128,128,0.08);font-size:0.95em;line-height:1.5;}",
+  ".stat-sheet > .stat-line:first-child{font-weight:700;font-size:1.02em;}",
+  ".stat-line{margin:0.12em 0;}",
+  ".stat-block{margin:0.4em 0;padding-left:1.4em;list-style:disc;}",
+  ".stat-block li{margin:0.12em 0;}",
+  // Percentages: a base weight; the red→green hue is an inline style per value.
+  ".pct{font-weight:700;}",
+  // Build/status keywords.
+  ".status-good{color:#2f9e44;font-weight:600;}",
+  ".status-warn{color:#b8860b;font-weight:600;}",
+  ".status-bad{color:#c92a2a;font-weight:600;}",
+  ".status-info{color:#3b82f6;font-weight:600;}",
   ...RARITY_TIERS.map((t) => `.rarity-${t.key}{${t.css}}`),
 ].join("\n")
 
@@ -197,8 +211,161 @@ const RARITY_TAG_RE = /\[([A-Za-z][A-Za-z '+-]{0,30}?)\]/g
  * bracketed text in ordinary prose is never colorized.
  */
 export function colorizeRarities(escapedText: string): string {
-  return escapedText.replace(RARITY_TAG_RE, (full, inner: string) => {
-    const cls = RARITY_LOOKUP.get(inner.trim().toLowerCase())
-    return cls ? `<span class="${cls}">${full}</span>` : full
+  return applyOutsideSpans(escapedText, (s) =>
+    s.replace(RARITY_TAG_RE, (full, inner: string) => {
+      const cls = RARITY_LOOKUP.get(inner.trim().toLowerCase())
+      return cls ? `<span class="${cls}">${full}</span>` : full
+    }),
+  )
+}
+
+// ── Percentages ────────────────────────────────────────────────────────────
+
+/**
+ * Map a 0..1 ratio to a red→amber→green color. HSL keeps a constant, mid
+ * lightness so every step is legible on both light and dark backgrounds.
+ */
+export function ratioColor(ratio: number): string {
+  const t = Math.max(0, Math.min(1, ratio))
+  const hue = Math.round(120 * t) // 0 = red, 60 = amber, 120 = green
+  return `hsl(${hue},80%,42%)`
+}
+
+const PERCENT_RE = /\d+(?:\.\d+)?%/g
+// A short run of separators (optionally the word "of") between two percentages —
+// e.g. "0.6% of 10%", "2.2%] [20%", "[4.9%]/[100%]" — marks them as a pair.
+const PAIR_GAP_RE = /^[\s\][:/()]*(?:of)?[\s\][:/()]*$/i
+
+/**
+ * Color percentages on a red→green gradient. When two percentages sit close
+ * together (e.g. "0.6% of 10%"), the SECOND is taken as the maximum — rendered
+ * green — and the first is colored by its ratio to that max. Standalone
+ * percentages are colored by value/100. Applied to all text (the user wants
+ * every percentage colored), outside any existing spans. Input must be escaped.
+ */
+export function colorizePercents(escapedText: string): string {
+  return applyOutsideSpans(escapedText, (s) => {
+    const hits = [...s.matchAll(PERCENT_RE)].map((m) => ({
+      value: parseFloat(m[0]),
+      start: m.index as number,
+      end: (m.index as number) + m[0].length,
+      text: m[0],
+    }))
+    if (hits.length === 0) return s
+
+    const ratios = hits.map((h) => Math.min(1, h.value / 100))
+    for (let i = 0; i < hits.length - 1; i++) {
+      const gap = s.slice(hits[i].end, hits[i + 1].start)
+      if (gap.length <= 6 && PAIR_GAP_RE.test(gap) && hits[i + 1].value > 0) {
+        ratios[i] = Math.min(1, hits[i].value / hits[i + 1].value)
+        ratios[i + 1] = 1 // the max → green
+        i++ // consume both halves of the pair
+      }
+    }
+
+    let out = ""
+    let prev = 0
+    hits.forEach((h, i) => {
+      out += s.slice(prev, h.start)
+      out += `<span class="pct" style="color:${ratioColor(ratios[i])}">${h.text}</span>`
+      prev = h.end
+    })
+    return out + s.slice(prev)
   })
+}
+
+// ── Build / status keywords ──────────────────────────────────────────────────
+
+/**
+ * Status and build-quality words → CSS class. Status words use the red→green
+ * `status-*` palette; grade words reuse the rarity tier colors. Matched
+ * case-insensitively, bracketed or bare, but ONLY inside stat sheets (see
+ * reconstruct.ts) so prose words like "complete" or "active" are never colored.
+ * Edit freely — this is the single source for build-keyword styling.
+ */
+export const KEYWORD_LOOKUP: Map<string, string> = new Map([
+  // Positive status → green
+  ...[
+    "excellent", "suitable", "suitability", "complete", "completed", "available",
+    "active", "guaranteed", "eligible", "unlocked", "stable", "ready", "optimal",
+    "success", "successful", "operational", "online", "approved", "enabled", "installed",
+  ].map((w) => [w, "status-good"] as const),
+  // Caution / in-progress → amber
+  ...[
+    "partial", "probable", "moderate", "recharging", "repairing", "restructuring",
+    "pending", "researching", "untested", "unknown", "standby", "processing",
+    "incomplete", "limited", "calculating", "calculated", "trace", "minimal",
+  ].map((w) => [w, "status-warn"] as const),
+  // Negative → red
+  ...[
+    "not found", "missing", "inactive", "failed", "failure", "critical", "offline",
+    "locked", "depleted", "error", "blocked", "denied", "insufficient",
+    "unavailable", "damaged", "red zone",
+  ].map((w) => [w, "status-bad"] as const),
+  // Informational → blue
+  ...["important", "significant", "extreme", "extraordinary"].map(
+    (w) => [w, "status-info"] as const,
+  ),
+  // Grades / build quality → rarity tier colors
+  ...[
+    ["crude", "rarity-broken"], ["worn", "rarity-broken"],
+    ["basic", "rarity-common"], ["standard", "rarity-common"],
+    ["refined", "rarity-uncommon"], ["improved", "rarity-uncommon"],
+    ["adept", "rarity-rare"], ["advanced", "rarity-rare"], ["superior", "rarity-rare"],
+    ["heroic", "rarity-elite"], ["grand", "rarity-elite"],
+    ["exquisite", "rarity-epic"], ["flawless", "rarity-epic"], ["pristine", "rarity-epic"],
+    ["masterwork", "rarity-epic"], ["masterpiece", "rarity-epic"],
+    ["mythic-grade", "rarity-mythic"], ["mythic", "rarity-mythic"],
+    ["mythical", "rarity-mythic"], ["fabled", "rarity-legendary"],
+  ].map(([w, c]) => [w, c] as const),
+])
+
+// Normalized lookup: separators (space/hyphen) collapsed to a single space, so a
+// match like "Mythic-Grade" or "Not Found" resolves regardless of the separator.
+const KEYWORD_NORM: Map<string, string> = new Map(
+  [...KEYWORD_LOOKUP].map(([k, v]) => [k.replace(/[ -]+/g, " "), v]),
+)
+const KEYWORD_RE = buildKeywordRegex([...KEYWORD_LOOKUP.keys()])
+
+function buildKeywordRegex(phrases: string[]): RegExp {
+  // Longest first so multi-word / hyphenated phrases win over their prefixes.
+  const alts = [...phrases]
+    .sort((a, b) => b.length - a.length)
+    .map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/ /g, "[ -]"))
+    .join("|")
+  // Letter-boundary lookarounds (not \b) so hyphens/colons don't split phrases.
+  return new RegExp(`(?<![A-Za-z])(?:${alts})(?![A-Za-z])`, "gi")
+}
+
+/**
+ * Color build/status keywords. Input must be escaped; applied outside existing
+ * spans so it never double-wraps a rarity or percentage span.
+ */
+export function colorizeStatKeywords(escapedText: string): string {
+  return applyOutsideSpans(escapedText, (s) =>
+    s.replace(KEYWORD_RE, (m) => {
+      const cls = KEYWORD_NORM.get(m.toLowerCase().replace(/[ -]+/g, " "))
+      return cls ? `<span class="${cls}">${m}</span>` : m
+    }),
+  )
+}
+
+// ── Shared helper ────────────────────────────────────────────────────────────
+
+const SPAN_RE = /<span\b[^>]*>.*?<\/span>/g
+
+/**
+ * Apply `fn` only to the parts of `html` that are NOT already inside a `<span>`.
+ * Lets the colorizers compose without nesting or double-wrapping each other's
+ * output. Spans here never nest, so a flat scan is sufficient.
+ */
+export function applyOutsideSpans(html: string, fn: (s: string) => string): string {
+  let out = ""
+  let last = 0
+  for (const m of html.matchAll(SPAN_RE)) {
+    out += fn(html.slice(last, m.index as number))
+    out += m[0]
+    last = (m.index as number) + m[0].length
+  }
+  return out + fn(html.slice(last))
 }

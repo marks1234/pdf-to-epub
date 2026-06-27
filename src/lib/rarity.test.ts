@@ -2,6 +2,9 @@ import { describe, it, expect } from "vitest"
 
 import {
   colorizeRarities,
+  colorizePercents,
+  colorizeStatKeywords,
+  ratioColor,
   RARITY_LOOKUP,
   RARITY_CSS,
   RARITY_TIERS,
@@ -93,5 +96,64 @@ describe("rarity table integrity", () => {
     expect(RARITY_LOOKUP.get("common")).toBe("rarity-common")
     expect(RARITY_LOOKUP.get("legendary")).toBe("rarity-legendary")
     expect(RARITY_LOOKUP.get("god tier")).toBe("rarity-godly")
+  })
+})
+
+describe("colorizePercents", () => {
+  it("colors a standalone percentage by value/100", () => {
+    expect(colorizePercents("Progress: 100%")).toBe(
+      `Progress: <span class="pct" style="color:${ratioColor(1)}">100%</span>`,
+    )
+    expect(colorizePercents("at 0%")).toContain(ratioColor(0))
+  })
+
+  it("treats the second of a close pair as the max (green) and ratios the first", () => {
+    const out = colorizePercents("[2.2% of 20%]")
+    // first colored by 2.2/20 = 0.11, second (max) green.
+    expect(out).toBe(
+      `[<span class="pct" style="color:${ratioColor(0.11)}">2.2%</span> of ` +
+        `<span class="pct" style="color:${ratioColor(1)}">20%</span>]`,
+    )
+  })
+
+  it("does not pair percentages separated by prose", () => {
+    const out = colorizePercents("up 61% then later 57% elsewhere")
+    expect(out).toContain(ratioColor(0.61))
+    expect(out).toContain(ratioColor(0.57))
+    expect(out).not.toContain(ratioColor(1)) // neither treated as a max
+  })
+
+  it("maps ratios red→green via hue", () => {
+    expect(ratioColor(0)).toBe("hsl(0,80%,42%)")
+    expect(ratioColor(0.5)).toBe("hsl(60,80%,42%)")
+    expect(ratioColor(1)).toBe("hsl(120,80%,42%)")
+  })
+})
+
+describe("colorizeStatKeywords", () => {
+  it("colors status words by good/warn/bad", () => {
+    expect(colorizeStatKeywords("[Suitability: Excellent]")).toContain(
+      '<span class="status-good">Excellent</span>',
+    )
+    expect(colorizeStatKeywords("[Recharging]")).toContain('class="status-warn"')
+    expect(colorizeStatKeywords("[Not Found]")).toBe(
+      '[<span class="status-bad">Not Found</span>]',
+    )
+  })
+
+  it("colors grade words with the matching rarity class", () => {
+    expect(colorizeStatKeywords("Crafted Grade Mythic-Grade")).toContain(
+      '<span class="rarity-mythic">Mythic-Grade</span>',
+    )
+    expect(colorizeStatKeywords("Build Quality Flawless")).toContain(
+      '<span class="rarity-epic">Flawless</span>',
+    )
+    expect(colorizeStatKeywords("[Advanced] tower")).toContain('class="rarity-rare"')
+  })
+
+  it("does not match a keyword embedded in a larger word", () => {
+    expect(colorizeStatKeywords("completely active radioactive")).toBe(
+      'completely <span class="status-good">active</span> radioactive',
+    )
   })
 })
