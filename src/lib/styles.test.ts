@@ -23,7 +23,17 @@ describe("createStyler.styleStat", () => {
     expect(styler.styleStat("[Suitability: Excellent]")).toContain('class="kw-good"')
     // Bare build-quality / grade words are matched by keyword groups.
     expect(styler.styleStat("Build Quality Flawless")).toContain('class="kw-grade-pink"')
-    expect(styler.styleStat("Mythic-Grade")).toContain('class="kw-grade-gold"')
+  })
+
+  it("matches rarity tiers bracketed, bare-with-suffix, and via word lists", () => {
+    expect(styler.styleStat("[Mythic] guild")).toContain('class="rarity-mythic"')
+    // "<tier>-grade" forms map to the tier color (BUG 1: "Mythic-grade").
+    expect(styler.styleStat("Crafted Grade Mythic-grade")).toContain(
+      '<span class="rarity-mythic">Mythic-grade</span>',
+    )
+    expect(styler.styleStat("a Legendary-grade item")).toContain('class="rarity-legendary"')
+    // Bare "Mythical" is a curated grade keyword (mythic-purple).
+    expect(styler.styleStat("Mythical sword")).toContain('class="kw-grade-gold"')
   })
 
   it("colors a standalone percentage and a close pair (second = max)", () => {
@@ -65,12 +75,24 @@ describe("cssFromConfig", () => {
   })
 })
 
-describe("textStyleCss gradient fallback", () => {
-  it("puts a solid color before the gradient and never color:transparent", () => {
-    const css = textStyleCss({ color: "#caa53d", gradient: ["#fff", "#000"], glow: "0 0 3px red", bold: true })
-    expect(css.indexOf("color:")).toBeLessThan(css.indexOf("background:"))
-    expect(css).toContain("-webkit-text-fill-color:transparent")
-    expect(css).not.toMatch(/(^|;)color:transparent/)
+describe("textStyleCss is Kindle-safe", () => {
+  it("uses a solid visible color and never the invisible-text gradient technique", () => {
+    const css = textStyleCss({ color: "#caa53d", glow: "0 0 4px rgba(1,2,3,.6)", bold: true })
+    expect(css).toContain("color:#caa53d")
+    expect(css).toContain("text-shadow:")
+    expect(css).toContain("font-weight:700")
+    // none of the Kindle-invisible techniques:
+    expect(css).not.toContain("background")
+    expect(css).not.toContain("-webkit-text-fill-color")
+    expect(css).not.toMatch(/color:\s*transparent/)
+  })
+
+  it("every default tier (incl. legendary+) emits a real solid color", () => {
+    const css = cssFromConfig(DEFAULT_STYLE_CONFIG)
+    expect(css).not.toContain("background-clip")
+    expect(css).not.toContain("transparent")
+    for (const t of DEFAULT_STYLE_CONFIG.rarities)
+      expect(css).toMatch(new RegExp(`\\.rarity-${t.key}\\{color:#`))
   })
 })
 

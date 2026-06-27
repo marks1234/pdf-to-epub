@@ -12,7 +12,7 @@ describe("blocksToHtml stat-sheet handling", () => {
     expect(html.startsWith('<div class="stat-sheet">')).toBe(true)
     expect(html.endsWith("</div>")).toBe(true)
     expect(html).toContain('<div class="stat-line">Crafted Grade ')
-    expect(html).toContain('class="kw-grade-gold"') // Mythic-Grade keyword group
+    expect(html).toContain('class="rarity-mythic"') // Mythic-Grade → tier color
     expect(html).toContain('class="pct"') // 100%
   })
 
@@ -50,5 +50,38 @@ describe("blocksToHtml stat-sheet handling", () => {
     const blocks: Block[] = [{ type: "li", text: "just one bullet point" }]
     const html = blocksToHtml(blocks)
     expect(html).toBe('<ul class="stat-block"><li>just one bullet point</li></ul>')
+  })
+
+  it("breaks a run-on ability list into one line per labeled entry", () => {
+    // The exact bug: several "Name: description" entries collapsed into one block.
+    const blocks: Block[] = [
+      {
+        type: "p",
+        text:
+          "Subsume: Allows the Soul Stealer to permanently acquire the unique ability of a defeated entity, improving attributes and innate abilities. " +
+          "Capture: Acquired essence can be efficiently repurposed and stored by the Soul Stealer for later use. " +
+          "Phylactery: Allows the Soul Stealer to create a customised physical vessel to hold captured essences. " +
+          "Reactor: Grants the Soul Stealer a near endless reserve of unrefined essence, partitioned for efficiency.",
+      },
+    ]
+    const html = blocksToHtml(blocks)
+    expect(html).toContain('<div class="stat-line">Subsume:')
+    expect(html).toContain('<div class="stat-line">Capture:')
+    expect(html).toContain('<div class="stat-line">Phylactery:')
+    expect(html).toContain('<div class="stat-line">Reactor:')
+  })
+
+  it("does NOT split ordinary prose that merely contains a colon", () => {
+    const blocks: Block[] = [
+      {
+        type: "p",
+        text:
+          "He had one rule above all others: never trust a Switcher. " +
+          "It was advice his mother gave him long ago, and it had kept him alive more than once.",
+      },
+    ]
+    const html = blocksToHtml(blocks)
+    expect(html.startsWith("<p>")).toBe(true)
+    expect(html).not.toContain("stat-line")
   })
 })

@@ -169,17 +169,49 @@ function bracketCount(t: string): number {
   return (t.match(/\[/g) || []).length
 }
 
+// A "Label: description" entry — 1–3 capitalized words then a colon+space.
+const ABILITY_LABEL_RE = /(?:^|\s)[A-Z][A-Za-z'()]+(?:\s[A-Z][A-Za-z'()]+){0,2}:\s/g
+// A break point between entries: sentence-ending punctuation immediately before
+// the next labeled entry. Requiring the `.`/`!`/`?`/`]` keeps it from splitting
+// inside a sentence that merely contains a "Word:".
+const ABILITY_SPLIT_RE =
+  /([.!?\]])\s+(?=[A-Z][A-Za-z'()]+(?:\s[A-Z][A-Za-z'()]+){0,2}:\s)/g
+
+function abilityLabelCount(text: string): number {
+  return (text.match(ABILITY_LABEL_RE) || []).length
+}
+
+/**
+ * A run-on paragraph of labeled ability entries — several "Name: description"
+ * items (e.g. "Capture: … Phylactery: …") collapsed by reflow into one block.
+ * Gated on length AND count so short "Label: [value]" stat lines and ordinary
+ * prose with a stray colon are never treated as ability blocks.
+ */
+function isAbilityBlock(text: string): boolean {
+  return text.length >= 200 && abilityLabelCount(text) >= 3
+}
+
+/** Split an ability block into one line per "Name: description" entry. */
+function splitAbilityEntries(text: string): string[] {
+  return text.replace(ABILITY_SPLIT_RE, "$1\n").split("\n")
+}
+
 /** A block that belongs in a stat sheet rather than the prose flow. */
 function isStatLike(b: Block): boolean {
   if (b.type === "li") return true
   const t = b.text
-  return bracketCount(t) >= 2 || /\d%/.test(t) || STAT_LABEL_RE.test(t)
+  return bracketCount(t) >= 2 || /\d%/.test(t) || STAT_LABEL_RE.test(t) || isAbilityBlock(t)
 }
 
 /** Strong enough that a single such block is worth boxing on its own. */
 function isStrongStat(b: Block): boolean {
   const t = b.text
-  return bracketCount(t) >= 4 || (t.match(/\d%/g) || []).length >= 2 || STAT_LABEL_RE.test(t)
+  return (
+    bracketCount(t) >= 4 ||
+    (t.match(/\d%/g) || []).length >= 2 ||
+    STAT_LABEL_RE.test(t) ||
+    isAbilityBlock(t)
+  )
 }
 
 // Split a run-on stat paragraph where two fields were glued with no space —
@@ -244,7 +276,12 @@ export function blocksToHtml(blocks: Block[], styler: Styler = DEFAULT_STYLER): 
         while (j < run.length && run[j].type === "li") items.push(run[j++].text)
         parts.push(renderStatList(items, styler))
       } else {
-        for (const line of splitGluedFields(run[j].text)) {
+        // Ability lists split per "Name: description" entry; other field lines
+        // split where extraction glued two fields together.
+        const lines = isAbilityBlock(run[j].text)
+          ? splitAbilityEntries(run[j].text)
+          : splitGluedFields(run[j].text)
+        for (const line of lines) {
           if (line.trim()) parts.push(`<div class="stat-line">${styler.styleStat(line)}</div>`)
         }
         j++

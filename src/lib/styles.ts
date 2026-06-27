@@ -10,12 +10,18 @@
 
 // ── Model ────────────────────────────────────────────────────────────────────
 
-/** A reusable inline text appearance. `gradient` (2+ stops) overrides `color`. */
+/**
+ * A reusable inline text appearance. `color` is always a real, visible color
+ * (Kindle-safe — see {@link textStyleCss}). `glow` is an optional text-shadow
+ * for "fancy" tiers. `gradient` is legacy/decorative metadata only and is NOT
+ * rendered (CSS gradient-on-text is invisible in Kindle).
+ */
 export interface TextStyle {
   color: string
-  gradient: string[]
   glow: string
   bold: boolean
+  /** @deprecated never rendered — kept for backward-compat with saved configs. */
+  gradient?: string[]
 }
 
 /** A rarity tier matched as a bracketed word, e.g. `[Legendary]`. */
@@ -61,11 +67,15 @@ export interface StyleConfig {
 // ── Color helpers ────────────────────────────────────────────────────────────
 
 function flat(color: string, bold = true): TextStyle {
-  return { color, gradient: [], glow: "", bold }
+  return { color, glow: "", bold }
 }
 
-function grad(color: string, gradient: string[], glow: string): TextStyle {
-  return { color, gradient, glow, bold: true }
+// Legendary+ "fancy" tier: a solid, visible color plus a glow derived from it.
+// (We deliberately do NOT use a CSS gradient — see textStyleCss.) The second arg
+// is the legacy gradient stops, kept at the call sites as documentation but
+// ignored; `glow` is what actually renders.
+function grad(color: string, _stops: string[], glow: string): TextStyle {
+  return { color, glow, bold: true }
 }
 
 function clampByte(n: number): number {
@@ -77,6 +87,13 @@ function hexToRgb(hex: string): [number, number, number] {
   const v = h.length === 3 ? h.replace(/(.)/g, "$1$1") : h
   const n = parseInt(v, 16)
   return [(n >> 16) & 255, (n >> 8) & 255, n & 255]
+}
+
+/** A soft glow (text-shadow) derived from a color — used for legendary+ tiers. */
+export function glowFor(color: string): string {
+  if (!/^#[0-9a-f]{3,6}$/i.test(color)) return "0 0 4px rgba(120,120,120,0.5)"
+  const [r, g, b] = hexToRgb(color)
+  return `0 0 4px rgba(${r},${g},${b},0.6)`
 }
 
 function lerp(a: number, b: number, t: number): number {
@@ -94,20 +111,19 @@ export function percentColor(ratio: number, p: PercentStyle): string {
   return `rgb(${c[0]},${c[1]},${c[2]})`
 }
 
-/** CSS declarations for a TextStyle. Gradient text keeps a solid fallback first. */
+/**
+ * CSS declarations for a TextStyle. KINDLE-SAFE: the text is always a real,
+ * visible solid color. We never use `background-clip:text` + transparent fill —
+ * Kindle ignores the clip but honors the transparent text, leaving an invisible
+ * colored rectangle. "Fancy" tiers (legendary+) instead get a `text-shadow`
+ * glow, heavier weight and a hint of letter-spacing — all of which degrade
+ * gracefully to plain solid bold text when unsupported.
+ */
 export function textStyleCss(s: TextStyle): string {
-  const weight = s.bold ? "font-weight:600;" : ""
-  if (s.gradient.length >= 2) {
-    return (
-      `color:${s.color};` +
-      `background:linear-gradient(90deg,${s.gradient.join(",")});` +
-      `-webkit-background-clip:text;background-clip:text;` +
-      `-webkit-text-fill-color:transparent;` +
-      (s.glow ? `text-shadow:${s.glow};` : "") +
-      "font-weight:700;"
-    )
-  }
-  return `color:${s.color};` + (s.glow ? `text-shadow:${s.glow};` : "") + weight
+  let css = `color:${s.color};`
+  if (s.glow) css += `text-shadow:${s.glow};letter-spacing:0.02em;`
+  css += `font-weight:${s.glow ? 700 : s.bold ? 600 : 400};`
+  return css
 }
 
 // ── Default config (the built-in look) ───────────────────────────────────────
@@ -180,18 +196,28 @@ export function createStyler(config: StyleConfig): Styler {
   for (const t of config.rarities)
     for (const w of t.words) rarityLookup.set(w.toLowerCase(), `rarity-${t.key}`)
 
-  const keywordLookup = new Map<string, string>()
+  // Bare/keyword forms → class. Includes the configured keyword groups plus an
+  // auto-derived "<rarityword>-grade" form (e.g. "Mythic-grade", "Legendary-grade")
+  // that maps to the tier color. The required "-grade" suffix keeps these bare
+  // matches safe from ordinary prose (unlike bare tier words like "set"/"fine").
+  const keywordEntries: [string, string][] = []
   for (const g of config.keywords)
-    for (const w of g.words) keywordLookup.set(w.replace(/[ -]+/g, " "), `kw-${g.key}`)
+    for (const w of g.words) keywordEntries.push([w, `kw-${g.key}`])
+  for (const t of config.rarities)
+    for (const w of t.words) keywordEntries.push([`${w}-grade`, `rarity-${t.key}`])
 
-  const allKeywords = config.keywords.flatMap((g) => g.words)
+  const keywordLookup = new Map<string, string>()
+  for (const [phrase, cls] of keywordEntries)
+    keywordLookup.set(phrase.replace(/[ -]+/g, " "), cls)
+
+  const allKeywords = keywordEntries.map(([phrase]) => phrase)
   const keywordRe =
     allKeywords.length > 0
       ? new RegExp(
           "(?<![A-Za-z])(?:" +
             [...allKeywords]
               .sort((a, b) => b.length - a.length)
-              .map((p) => escapeRegex(p).replace(/ /g, "[ -]"))
+              .map((p) => escapeRegex(p).replace(/[ -]/g, "[ -]"))
               .join("|") +
             ")(?![A-Za-z])",
           "gi",
@@ -295,17 +321,6 @@ export const PALETTE: { name: string; color: string }[] = [
   { name: "Indigo", color: "#4f46e5" }, { name: "Violet", color: "#7c3aed" },
   { name: "Purple", color: "#a45ad6" }, { name: "Fuchsia", color: "#cf5fc9" },
   { name: "Pink", color: "#db2777" }, { name: "Rose", color: "#e11d48" },
-]
-
-/** A few ready-made gradient presets users can apply to a tier. */
-export const GRADIENT_PRESETS: { name: string; stops: string[]; glow: string }[] = [
-  { name: "Gold", stops: ["#f9d976", "#e6b422", "#fff4c2", "#d4af37"], glow: "0 0 3px rgba(212,175,55,.55)" },
-  { name: "Amethyst", stops: ["#a44bd4", "#d98bff", "#7a2fb0", "#c77dff"], glow: "0 0 4px rgba(170,90,230,.6)" },
-  { name: "Bronze", stops: ["#cd7f32", "#e8a85a", "#8c5a2b", "#d9a066"], glow: "0 0 3px rgba(205,127,50,.5)" },
-  { name: "Inferno", stops: ["#ff8a1e", "#ff3b2f", "#ffb347"], glow: "0 0 4px rgba(255,80,40,.55)" },
-  { name: "Iridescent", stops: ["#ff6ec4", "#7873f5", "#4ade80", "#ffd166"], glow: "0 0 5px rgba(120,115,245,.55)" },
-  { name: "Galaxy", stops: ["#6a3cff", "#9d4edd", "#3b4fd8", "#b06bff"], glow: "0 0 6px rgba(120,80,255,.65)" },
-  { name: "Prismatic", stops: ["#ff0040", "#ff8a00", "#ffe600", "#33ff57", "#00d0ff", "#7a5cff", "#ff44e0"], glow: "0 0 8px rgba(255,255,255,.7)" },
 ]
 
 /** Deep clone a config so the editor can mutate a draft safely. */

@@ -25,10 +25,10 @@ import { cn } from "@/lib/utils"
 import { blocksToHtml, type Block } from "@/lib/reconstruct"
 import {
   DEFAULT_STYLE_CONFIG,
-  GRADIENT_PRESETS,
   PALETTE,
   cloneConfig,
   createStyler,
+  glowFor,
   type KeywordGroup,
   type RarityTier,
   type StyleConfig,
@@ -233,7 +233,14 @@ export function StyleEditor({
                       <ColorField
                         value={t.style.color}
                         onChange={(color) =>
-                          patchTier(i, { style: { ...t.style, color } })
+                          patchTier(i, {
+                            style: {
+                              ...t.style,
+                              color,
+                              // keep the glow tinted to the new color
+                              glow: t.style.glow ? glowFor(color) : "",
+                            },
+                          })
                         }
                       />
                       <span className="w-24 shrink-0 truncate text-sm font-medium">
@@ -245,38 +252,24 @@ export function StyleEditor({
                         className="h-7 flex-1 text-xs"
                         placeholder="words…"
                       />
-                      <select
-                        value={t.style.gradient.length ? "on" : "off"}
-                        onChange={(e) => {
-                          if (e.target.value === "off")
-                            patchTier(i, { style: { ...t.style, gradient: [], glow: "" } })
-                          else {
-                            const g = GRADIENT_PRESETS[0]
-                            patchTier(i, { style: { ...t.style, gradient: g.stops, glow: g.glow } })
-                          }
-                        }}
-                        className="h-7 rounded-md border bg-background px-1 text-xs"
-                        title="Gradient"
+                      <label
+                        className="flex h-7 shrink-0 items-center gap-1 rounded-md border px-2 text-xs"
+                        title="Adds a soft glow + heavier weight (Kindle-safe)"
                       >
-                        <option value="off">flat</option>
-                        <option value="on">gradient</option>
-                      </select>
-                      {t.style.gradient.length > 0 && (
-                        <select
-                          value=""
-                          onChange={(e) => {
-                            const g = GRADIENT_PRESETS.find((p) => p.name === e.target.value)
-                            if (g) patchTier(i, { style: { ...t.style, gradient: g.stops, glow: g.glow } })
-                          }}
-                          className="h-7 w-20 rounded-md border bg-background px-1 text-xs"
-                          title="Gradient preset"
-                        >
-                          <option value="">preset…</option>
-                          {GRADIENT_PRESETS.map((g) => (
-                            <option key={g.name} value={g.name}>{g.name}</option>
-                          ))}
-                        </select>
-                      )}
+                        <input
+                          type="checkbox"
+                          checked={!!t.style.glow}
+                          onChange={(e) =>
+                            patchTier(i, {
+                              style: {
+                                ...t.style,
+                                glow: e.target.checked ? glowFor(t.style.color) : "",
+                              },
+                            })
+                          }
+                        />
+                        glow
+                      </label>
                     </div>
                   ))}
                 </div>
