@@ -12,7 +12,7 @@ describe("blocksToHtml stat-sheet handling", () => {
     expect(html.startsWith('<div class="stat-sheet">')).toBe(true)
     expect(html.endsWith("</div>")).toBe(true)
     expect(html).toContain('<div class="stat-line">Crafted Grade ')
-    expect(html).toContain('class="rarity-mythic"') // Mythic-Grade
+    expect(html).toContain('class="kw-grade-gold"') // Mythic-Grade keyword group
     expect(html).toContain('class="pct"') // 100%
   })
 
@@ -29,8 +29,8 @@ describe("blocksToHtml stat-sheet handling", () => {
     expect(html).toContain('<div class="stat-line">Capacitor:')
     expect(html).toContain('<div class="stat-line">Internal Damage:')
     expect(html).toContain('<div class="stat-line">External Damage:')
-    expect(html).toContain('class="status-good">Active') // status keyword
-    expect(html).toContain('class="status-bad">Missing')
+    expect(html).toContain('class="kw-good">Active') // status keyword
+    expect(html).toContain('class="kw-bad">Missing')
     expect(html).toContain('class="pct"') // 16.2% / 0.8%
   })
 
@@ -41,7 +41,7 @@ describe("blocksToHtml stat-sheet handling", () => {
     const html = blocksToHtml(blocks)
     expect(html.startsWith("<p>")).toBe(true)
     expect(html).not.toContain("stat-sheet")
-    expect(html).not.toContain("status-") // no keyword coloring in prose
+    expect(html).not.toContain("kw-") // no keyword coloring in prose
     expect(html).toContain('class="pct"') // but 90% is colored
     expect(html).toContain("[thing]") // bracket left alone
   })

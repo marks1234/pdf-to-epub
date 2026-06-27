@@ -7,10 +7,13 @@
  * `Glyph`) and wraps the result in the EPUB.
  */
 import {
-  colorizePercents,
-  colorizeRarities,
-  colorizeStatKeywords,
-} from "@/lib/rarity"
+  createStyler,
+  DEFAULT_STYLE_CONFIG,
+  type Styler,
+} from "@/lib/styles"
+
+/** The built-in styler; rendering uses this unless a custom one is passed. */
+export const DEFAULT_STYLER: Styler = createStyler(DEFAULT_STYLE_CONFIG)
 
 // Characters illegal in XML 1.0: control chars below 0x20 except tab/newline/CR,
 // plus the U+FFFE/U+FFFF non-characters. PDF text extraction occasionally emits
@@ -190,33 +193,30 @@ function splitGluedFields(text: string): string[] {
   return text.replace(GLUED_FIELD_RE, "$1\n").split("\n")
 }
 
-/** Full stat styling for one escaped line: rarities, keywords, then percents. */
-function styleStat(text: string): string {
-  return colorizePercents(colorizeStatKeywords(colorizeRarities(escapeHtml(text))))
-}
-
-/** Render the bullets of a stat run as a list, styled. */
-function renderStatList(items: string[]): string {
-  return `<ul class="stat-block">${items.map((t) => `<li>${styleStat(t)}</li>`).join("")}</ul>`
+/** Render the bullets of a stat run as a list, styled by the given styler. */
+function renderStatList(items: string[], styler: Styler): string {
+  return `<ul class="stat-block">${items.map((t) => `<li>${styler.styleStat(t)}</li>`).join("")}</ul>`
 }
 
 /**
- * Render blocks as chapter HTML.
+ * Render blocks as chapter HTML using `styler` (defaults to the built-in look).
  *
  * Runs of stat-like blocks become a `<div class="stat-sheet">` panel: bullets
  * render as a styled `<ul>`, and field lines (de-glued where needed) render as
  * `<div class="stat-line">`, all with rarity / keyword / percentage coloring.
  * Ordinary prose stays a plain `<p>` — only percentages are colored there (the
  * user wants every percentage colored), never the keyword/box styling.
+ *
+ * Passing a custom styler is how the Style Editor re-renders an EPUB.
  */
-export function blocksToHtml(blocks: Block[]): string {
+export function blocksToHtml(blocks: Block[], styler: Styler = DEFAULT_STYLER): string {
+  const prose = (text: string) => `<p>${styler.percents(escapeHtml(text))}</p>`
   const out: string[] = []
   let i = 0
 
   while (i < blocks.length) {
     if (!isStatLike(blocks[i])) {
-      // Prose: plain paragraph, percentages still colored.
-      out.push(`<p>${colorizePercents(escapeHtml(blocks[i].text))}</p>`)
+      out.push(prose(blocks[i].text))
       i++
       continue
     }
@@ -228,11 +228,10 @@ export function blocksToHtml(blocks: Block[]): string {
     const substantial = run.length >= 2 || isStrongStat(run[0])
 
     if (!substantial) {
-      // A lone weak stat block: keep it light. A bullet → a small styled list;
-      // a weak paragraph → prose (percentages only) to stay safe.
+      // A lone weak stat block: a bullet → a small styled list; a weak
+      // paragraph → prose (percentages only) to stay safe.
       const b = run[0]
-      if (b.type === "li") out.push(renderStatList([b.text]))
-      else out.push(`<p>${colorizePercents(escapeHtml(b.text))}</p>`)
+      out.push(b.type === "li" ? renderStatList([b.text], styler) : prose(b.text))
       continue
     }
 
@@ -243,10 +242,10 @@ export function blocksToHtml(blocks: Block[]): string {
       if (run[j].type === "li") {
         const items: string[] = []
         while (j < run.length && run[j].type === "li") items.push(run[j++].text)
-        parts.push(renderStatList(items))
+        parts.push(renderStatList(items, styler))
       } else {
         for (const line of splitGluedFields(run[j].text)) {
-          if (line.trim()) parts.push(`<div class="stat-line">${styleStat(line)}</div>`)
+          if (line.trim()) parts.push(`<div class="stat-line">${styler.styleStat(line)}</div>`)
         }
         j++
       }

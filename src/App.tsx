@@ -25,6 +25,7 @@ import {
   Inbox,
   Loader2,
   Merge,
+  Palette,
   TriangleAlert,
   Trash2,
   UploadCloud,
@@ -36,12 +37,14 @@ import {
   type PdfItem,
 } from "@/components/sortable-file-item"
 import { MemoField } from "@/components/memo-field"
+import { StyleEditor } from "@/components/style-editor"
 import { cn } from "@/lib/utils"
 import { mergePdfs, countPages } from "@/lib/merge-pdf"
-import { pdfToEpub } from "@/lib/pdf-to-epub"
+import { pdfToEpub, restyleEpub } from "@/lib/pdf-to-epub"
 import { downloadBlob } from "@/lib/download"
 import { formatBytes, formatDate } from "@/lib/format"
-import { HISTORY_CAP } from "@/lib/storage"
+import { DEFAULT_STYLE_CONFIG, type StyleConfig } from "@/lib/styles"
+import { HISTORY_CAP, type OutputRecord } from "@/lib/storage"
 import {
   analyzeSequence,
   extractNumber,
@@ -50,6 +53,7 @@ import {
 } from "@/lib/sequence"
 import { useNameMemory } from "@/hooks/use-name-memory"
 import { useOutputs } from "@/hooks/use-outputs"
+import { useStyleProfiles } from "@/hooks/use-style-profiles"
 
 type Busy = "idle" | "merging" | "converting"
 
@@ -73,6 +77,28 @@ export default function App() {
   const titleMemory = useNameMemory("pdf2epub.titles")
   const authorMemory = useNameMemory("pdf2epub.authors")
   const history = useOutputs()
+  const styleProfiles = useStyleProfiles()
+
+  const [styling, setStyling] = useState<OutputRecord | null>(null)
+  const [restyleBusy, setRestyleBusy] = useState(false)
+
+  const applyStyle = async (out: OutputRecord, config: StyleConfig) => {
+    if (!out.chapters) return
+    setRestyleBusy(true)
+    try {
+      const blob = await restyleEpub(
+        out.chapters,
+        { title: out.title, author: out.author || "Unknown" },
+        config,
+      )
+      await history.add({ ...out, blob, size: blob.size, style: config })
+      setStyling(null)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to apply styles.")
+    } finally {
+      setRestyleBusy(false)
+    }
+  }
 
   const seq = useMemo(
     () => analyzeSequence(items.map((i) => i.file.name)),
@@ -168,7 +194,7 @@ export default function App() {
     try {
       const files = items.map((i) => i.file)
       const pages = await countPages(files)
-      const blob = await pdfToEpub(files, {
+      const { blob, chapters } = await pdfToEpub(files, {
         title: title || "Merged Document",
         author: author || "Unknown",
       })
@@ -183,6 +209,7 @@ export default function App() {
         pageCount: pages,
         size: blob.size,
         createdAt: Date.now(),
+        chapters,
       })
       rememberNames()
     } catch (e) {
@@ -489,6 +516,16 @@ export default function App() {
                       </div>
                     </div>
                     <div className="mt-3 flex justify-end gap-2">
+                      {out.kind === "epub" && (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => setStyling(out)}
+                        >
+                          <Palette className="size-4" />
+                          Style
+                        </Button>
+                      )}
                       <Button
                         variant="secondary"
                         size="sm"
@@ -515,6 +552,21 @@ export default function App() {
           </div>
         </section>
       </main>
+
+      {styling && (
+        <StyleEditor
+          open={!!styling}
+          onOpenChange={(o) => !o && setStyling(null)}
+          filename={styling.filename}
+          initialConfig={styling.style ?? DEFAULT_STYLE_CONFIG}
+          canRestyle={!!styling.chapters}
+          profiles={styleProfiles.profiles}
+          busy={restyleBusy}
+          onApply={(config) => void applyStyle(styling, config)}
+          onSaveProfile={(name, config) => void styleProfiles.save(name, config)}
+          onDeleteProfile={(id) => void styleProfiles.remove(id)}
+        />
+      )}
     </div>
   )
 }

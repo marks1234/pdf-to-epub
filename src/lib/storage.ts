@@ -6,9 +6,13 @@
  * input PDF bytes — only their names.
  */
 
+import type { Chapter } from "@/lib/pdf-to-epub"
+import type { StyleConfig } from "@/lib/styles"
+
 const DB_NAME = "pdf-to-epub"
 const STORE = "outputs"
-const VERSION = 1
+const PROFILE_STORE = "styleProfiles"
+const VERSION = 2
 
 /** Maximum number of outputs to retain; oldest beyond this are pruned. */
 export const HISTORY_CAP = 50
@@ -27,6 +31,19 @@ export interface OutputRecord {
   pageCount: number | null
   size: number
   createdAt: number
+  /** Reconstructed chapters (EPUBs only), kept so the EPUB can be re-styled. */
+  chapters?: Chapter[]
+  /** The style config last applied to this EPUB (defaults to the built-in look). */
+  style?: StyleConfig
+}
+
+/** A saved, reusable style configuration. */
+export interface StyleProfile {
+  id: string
+  name: string
+  config: StyleConfig
+  createdAt: number
+  updatedAt: number
 }
 
 function openDB(): Promise<IDBDatabase> {
@@ -38,6 +55,9 @@ function openDB(): Promise<IDBDatabase> {
         const store = db.createObjectStore(STORE, { keyPath: "id" })
         store.createIndex("createdAt", "createdAt")
       }
+      if (!db.objectStoreNames.contains(PROFILE_STORE)) {
+        db.createObjectStore(PROFILE_STORE, { keyPath: "id" })
+      }
     }
     req.onsuccess = () => resolve(req.result)
     req.onerror = () => reject(req.error)
@@ -47,8 +67,9 @@ function openDB(): Promise<IDBDatabase> {
 function tx(
   db: IDBDatabase,
   mode: IDBTransactionMode,
+  store: string = STORE,
 ): IDBObjectStore {
-  return db.transaction(STORE, mode).objectStore(STORE)
+  return db.transaction(store, mode).objectStore(store)
 }
 
 export async function addOutput(record: OutputRecord): Promise<void> {
@@ -144,4 +165,39 @@ export async function getStorageEstimate(): Promise<StorageEstimate | null> {
   if (!navigator.storage?.estimate) return null
   const { usage = 0, quota = 0 } = await navigator.storage.estimate()
   return { usage, quota }
+}
+
+// ── Style profiles ───────────────────────────────────────────────────────────
+
+export async function saveStyleProfile(profile: StyleProfile): Promise<void> {
+  const db = await openDB()
+  await new Promise<void>((resolve, reject) => {
+    const store = tx(db, "readwrite", PROFILE_STORE)
+    store.put(profile)
+    store.transaction.oncomplete = () => resolve()
+    store.transaction.onerror = () => reject(store.transaction.error)
+  })
+  db.close()
+}
+
+export async function getStyleProfiles(): Promise<StyleProfile[]> {
+  const db = await openDB()
+  const result = await new Promise<StyleProfile[]>((resolve, reject) => {
+    const req = tx(db, "readonly", PROFILE_STORE).getAll()
+    req.onsuccess = () => resolve(req.result as StyleProfile[])
+    req.onerror = () => reject(req.error)
+  })
+  db.close()
+  return result.sort((a, b) => b.updatedAt - a.updatedAt)
+}
+
+export async function deleteStyleProfile(id: string): Promise<void> {
+  const db = await openDB()
+  await new Promise<void>((resolve, reject) => {
+    const store = tx(db, "readwrite", PROFILE_STORE)
+    store.delete(id)
+    store.transaction.oncomplete = () => resolve()
+    store.transaction.onerror = () => reject(store.transaction.error)
+  })
+  db.close()
 }

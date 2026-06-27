@@ -6,8 +6,13 @@ import jEpub from "jepub"
 import JSZip from "jszip"
 
 import { extractNumber } from "@/lib/sequence"
-import { RARITY_CSS } from "@/lib/rarity"
-import { blocksToHtml, reconstructBlocks, type Block } from "@/lib/reconstruct"
+import {
+  DEFAULT_STYLER,
+  blocksToHtml,
+  reconstructBlocks,
+  type Block,
+} from "@/lib/reconstruct"
+import { createStyler, type StyleConfig, type Styler } from "@/lib/styles"
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl
 
@@ -20,6 +25,12 @@ export interface EpubMetadata {
   author: string
   publisher?: string
   description?: string
+}
+
+/** One chapter's reconstructed content; stored so an EPUB can be re-styled later. */
+export interface Chapter {
+  title: string
+  blocks: Block[]
 }
 
 function isTextItem(item: unknown): item is TextItem {
@@ -50,8 +61,8 @@ function fixNcxPlayOrder(xml: string): string {
   return xml.replace(/playOrder="\d+"/g, () => `playOrder="${++n}"`)
 }
 
-// Where the rarity stylesheet lives in the EPUB. Pages sit in OEBPS/ and link it
-// by relative name; the OPF (book.opf, at the zip root) references it with the
+// Where the stylesheet lives in the EPUB. Pages sit in OEBPS/ and link it by
+// relative name; the OPF (book.opf, at the zip root) references it with the
 // OEBPS/ prefix. jepub ships no stylesheet, so we add and wire up our own.
 const STYLESHEET_PATH = "OEBPS/style.css"
 const STYLESHEET_HREF = "style.css"
@@ -73,10 +84,10 @@ function linkCss(html: string): string {
  * as required by the OCF spec, and fix the NCX play order. jepub/JSZip otherwise
  * trip epubcheck (PKG-007 / RSC-005) and stricter readers like Send-to-Kindle.
  *
- * Also injects the rarity stylesheet: writes OEBPS/style.css, declares it in the
+ * Also injects the stylesheet `css`: writes OEBPS/style.css, declares it in the
  * OPF manifest, and links it from every XHTML page.
  */
-async function normalizeOcf(epubBlob: Blob): Promise<Blob> {
+async function normalizeOcf(epubBlob: Blob, css: string): Promise<Blob> {
   const src = await JSZip.loadAsync(epubBlob)
   const out = new JSZip()
 
@@ -101,7 +112,7 @@ async function normalizeOcf(epubBlob: Blob): Promise<Blob> {
     }
   }
 
-  out.file(STYLESHEET_PATH, RARITY_CSS, { compression: "DEFLATE" })
+  out.file(STYLESHEET_PATH, css, { compression: "DEFLATE" })
 
   return out.generateAsync({
     type: "blob",
@@ -109,8 +120,8 @@ async function normalizeOcf(epubBlob: Blob): Promise<Blob> {
   })
 }
 
-/** Extract the text of one PDF as paragraph HTML across all its pages. */
-async function pdfFileToHtml(file: File): Promise<string> {
+/** Reconstruct one PDF file into a titled chapter of blocks. */
+async function pdfFileToChapter(file: File): Promise<Chapter> {
   const bytes = new Uint8Array(await file.arrayBuffer())
   const pdf = await pdfjsLib.getDocument({ data: bytes }).promise
 
@@ -121,30 +132,27 @@ async function pdfFileToHtml(file: File): Promise<string> {
     const items = content.items.filter(isTextItem)
     blocks.push(...reconstructBlocks(items))
   }
+  return { title: chapterTitle(file.name), blocks }
+}
 
-  if (blocks.length === 0) {
-    return "<p><em>(no extractable text — this PDF may be scanned images)</em></p>"
-  }
-  return blocksToHtml(blocks)
+/** Reconstruct PDF files into chapters (one per file), preserving queue order. */
+export async function pdfToChapters(files: File[]): Promise<Chapter[]> {
+  if (files.length === 0) throw new Error("Add at least one PDF to convert.")
+  const chapters: Chapter[] = []
+  for (const file of files) chapters.push(await pdfFileToChapter(file))
+  return chapters
 }
 
 /**
- * Convert a list of PDF files into a single EPUB — one chapter per file, titled
- * from the file name (e.g. "Chapter 22"). Text is reconstructed from glyph
- * geometry so words and paragraphs survive.
- *
- * Scanned PDFs without a text layer produce empty chapters (OCR would be needed).
- *
- * @param files Ordered PDF files (the queue order).
- * @param meta  EPUB metadata (title, author, ...).
- * @returns A spec-compliant EPUB Blob, ready to download.
+ * Build a spec-compliant EPUB from already-reconstructed chapters, rendering and
+ * styling them with `styler` (defaults to the built-in look). This is the shared
+ * path for first conversion and for re-styling from the Style Editor.
  */
-export async function pdfToEpub(
-  files: File[],
+export async function chaptersToEpub(
+  chapters: Chapter[],
   meta: EpubMetadata,
+  styler: Styler = DEFAULT_STYLER,
 ): Promise<Blob> {
-  if (files.length === 0) throw new Error("Add at least one PDF to convert.")
-
   const epub = new jEpub()
   epub.init({
     i18n: "en",
@@ -154,15 +162,41 @@ export async function pdfToEpub(
     description: meta.description || "",
   })
 
-  for (const file of files) {
-    const html = await pdfFileToHtml(file)
-    epub.add(chapterTitle(file.name), html)
+  for (const ch of chapters) {
+    const html =
+      ch.blocks.length === 0
+        ? "<p><em>(no extractable text — this PDF may be scanned images)</em></p>"
+        : blocksToHtml(ch.blocks, styler)
+    epub.add(ch.title, html)
   }
 
   // jepub references a notes page in its manifest; create it so the EPUB
   // doesn't point at a missing file (epubcheck RSC-001).
-  epub.notes(`Generated by pdf-to-epub from ${files.length} file(s).`)
+  epub.notes(`Generated by pdf-to-epub from ${chapters.length} file(s).`)
 
   const raw = (await epub.generate("blob")) as Blob
-  return normalizeOcf(raw)
+  return normalizeOcf(raw, styler.css)
+}
+
+/**
+ * Convert PDF files into a single EPUB — one chapter per file. Returns both the
+ * Blob and the reconstructed chapters so the caller can persist the chapters and
+ * re-style the EPUB later without re-parsing the PDFs.
+ */
+export async function pdfToEpub(
+  files: File[],
+  meta: EpubMetadata,
+): Promise<{ blob: Blob; chapters: Chapter[] }> {
+  const chapters = await pdfToChapters(files)
+  const blob = await chaptersToEpub(chapters, meta)
+  return { blob, chapters }
+}
+
+/** Re-render stored chapters into a new EPUB Blob using a custom style config. */
+export async function restyleEpub(
+  chapters: Chapter[],
+  meta: EpubMetadata,
+  config: StyleConfig,
+): Promise<Blob> {
+  return chaptersToEpub(chapters, meta, createStyler(config))
 }
