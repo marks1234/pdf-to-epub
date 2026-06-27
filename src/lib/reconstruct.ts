@@ -169,38 +169,82 @@ function bracketCount(t: string): number {
   return (t.match(/\[/g) || []).length
 }
 
-// A "Label: description" entry — 1–3 capitalized words then a colon+space.
-const ABILITY_LABEL_RE = /(?:^|\s)[A-Z][A-Za-z'()]+(?:\s[A-Z][A-Za-z'()]+){0,2}:\s/g
-// A break point between entries: sentence-ending punctuation immediately before
-// the next labeled entry. Requiring the `.`/`!`/`?`/`]` keeps it from splitting
-// inside a sentence that merely contains a "Word:".
-const ABILITY_SPLIT_RE =
-  /([.!?\]])\s+(?=[A-Z][A-Za-z'()]+(?:\s[A-Z][A-Za-z'()]+){0,2}:\s)/g
+// ── Labeled-field splitting ──────────────────────────────────────────────────
+// Stat sheets pack several "Label: value" fields — and "Name: description"
+// ability entries — into one reflowed paragraph. We break them into one line per
+// field. Tricky bits handled:
+//   • a colon INSIDE a bracket ("[Maestro: 1]") is not a field boundary (we track
+//     bracket depth and only split on depth-0 colons);
+//   • runs of adjacent bracket tags ("[A-Rank][B-Rank]…") stay on their field's
+//     line (no colon between them);
+//   • a value word right after a label ("No" in "Evolution: No Assimilation:") is
+//     not absorbed into the next label (we stop the label at a `: `-preceded word).
 
-function abilityLabelCount(text: string): number {
-  return (text.match(ABILITY_LABEL_RE) || []).length
+const LABEL_WORD = /[A-Za-z'.-]/
+
+/** Start index of the field label whose depth-0 colon is at `colonIdx`, else null. */
+function fieldLabelStart(text: string, colonIdx: number): number | null {
+  let labelStart: number | null = null
+  let words = 0
+  let i = colonIdx - 1
+  while (i >= 0 && words < 3) {
+    let j = i
+    while (j >= 0 && LABEL_WORD.test(text[j])) j--
+    const word = text.slice(j + 1, i + 1)
+    if (!/^[A-Z]/.test(word)) break
+    // A longer word ending in "." is a sentence end (e.g. "Phylacteries."), not a
+    // label abbreviation (e.g. "Est.") — stop without absorbing it.
+    if (word.endsWith(".") && word.length > 4) break
+    // A word immediately preceded by ": " is the previous field's value, not part
+    // of this label — stop without absorbing it.
+    if (text[j] === " " && text[j - 1] === ":") break
+    labelStart = j + 1
+    words++
+    if (text[j] !== " ") break // label words are single-space separated
+    i = j - 1
+  }
+  return labelStart
+}
+
+/** Split a reflowed stat paragraph into one string per "Label: value" field. */
+function splitLabeledFields(text: string): string[] {
+  const breaks = new Set<number>()
+  let depth = 0
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (ch === "[") depth++
+    else if (ch === "]") depth = Math.max(0, depth - 1)
+    else if (ch === ":" && depth === 0) {
+      const after = text[i + 1]
+      // A field colon is followed by a space, an opening bracket, or end-of-text.
+      if (after !== undefined && after !== " " && after !== "\t" && after !== "[") continue
+      const start = fieldLabelStart(text, i)
+      if (start !== null && start > 0) breaks.add(start)
+    }
+  }
+  const cuts = [0, ...[...breaks].sort((a, b) => a - b), text.length]
+  const parts: string[] = []
+  for (let k = 0; k < cuts.length - 1; k++) {
+    const seg = text.slice(cuts[k], cuts[k + 1]).replace(/^[|\s]+|[|\s]+$/g, "")
+    if (seg) parts.push(seg)
+  }
+  return parts.length ? parts : [text.trim()].filter(Boolean)
 }
 
 /**
- * A run-on paragraph of labeled ability entries — several "Name: description"
- * items (e.g. "Capture: … Phylactery: …") collapsed by reflow into one block.
- * Gated on length AND count so short "Label: [value]" stat lines and ordinary
- * prose with a stray colon are never treated as ability blocks.
+ * A reflowed paragraph that is really several "Label: value" fields. Gated on
+ * >=3 depth-0 field labels so ordinary prose (which rarely has three
+ * "Capitalized:" labels) and single "Label: [value]" stat lines are left alone.
  */
-function isAbilityBlock(text: string): boolean {
-  return text.length >= 200 && abilityLabelCount(text) >= 3
-}
-
-/** Split an ability block into one line per "Name: description" entry. */
-function splitAbilityEntries(text: string): string[] {
-  return text.replace(ABILITY_SPLIT_RE, "$1\n").split("\n")
+function isLabeledFieldBlock(text: string): boolean {
+  return splitLabeledFields(text).length >= 3
 }
 
 /** A block that belongs in a stat sheet rather than the prose flow. */
 function isStatLike(b: Block): boolean {
   if (b.type === "li") return true
   const t = b.text
-  return bracketCount(t) >= 2 || /\d%/.test(t) || STAT_LABEL_RE.test(t) || isAbilityBlock(t)
+  return bracketCount(t) >= 2 || /\d%/.test(t) || STAT_LABEL_RE.test(t) || isLabeledFieldBlock(t)
 }
 
 /** Strong enough that a single such block is worth boxing on its own. */
@@ -210,7 +254,7 @@ function isStrongStat(b: Block): boolean {
     bracketCount(t) >= 4 ||
     (t.match(/\d%/g) || []).length >= 2 ||
     STAT_LABEL_RE.test(t) ||
-    isAbilityBlock(t)
+    isLabeledFieldBlock(t)
   )
 }
 
@@ -276,10 +320,10 @@ export function blocksToHtml(blocks: Block[], styler: Styler = DEFAULT_STYLER): 
         while (j < run.length && run[j].type === "li") items.push(run[j++].text)
         parts.push(renderStatList(items, styler))
       } else {
-        // Ability lists split per "Name: description" entry; other field lines
-        // split where extraction glued two fields together.
-        const lines = isAbilityBlock(run[j].text)
-          ? splitAbilityEntries(run[j].text)
+        // Multi-field paragraphs split per "Label: value" entry; other field
+        // lines split where extraction glued two fields together.
+        const lines = isLabeledFieldBlock(run[j].text)
+          ? splitLabeledFields(run[j].text)
           : splitGluedFields(run[j].text)
         for (const line of lines) {
           if (line.trim()) parts.push(`<div class="stat-line">${styler.styleStat(line)}</div>`)

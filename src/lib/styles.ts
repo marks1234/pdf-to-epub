@@ -203,8 +203,13 @@ export function createStyler(config: StyleConfig): Styler {
   const keywordEntries: [string, string][] = []
   for (const g of config.keywords)
     for (const w of g.words) keywordEntries.push([w, `kw-${g.key}`])
-  for (const t of config.rarities)
+  for (const t of config.rarities) {
+    // Bare tier name (e.g. "Grade: Mythic") and "<word>-grade" forms (e.g.
+    // "Mythic-grade", "Legendary-grade") → the tier color. Bare matching uses the
+    // distinctive tier key only (not generic synonyms), and is stat-scoped.
+    keywordEntries.push([t.key, `rarity-${t.key}`])
     for (const w of t.words) keywordEntries.push([`${w}-grade`, `rarity-${t.key}`])
+  }
 
   const keywordLookup = new Map<string, string>()
   for (const [phrase, cls] of keywordEntries)
