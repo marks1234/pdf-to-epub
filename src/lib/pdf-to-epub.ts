@@ -9,9 +9,11 @@ import { extractNumber } from "@/lib/sequence"
 import {
   DEFAULT_STYLER,
   blocksToHtml,
-  reconstructBlocks,
+  reconstructChapterBlocks,
   type Block,
+  type Glyph,
 } from "@/lib/reconstruct"
+import { dehyphenateAll, normalizeCharacters } from "@/lib/cleanup"
 import { createStyler, type StyleConfig, type Styler } from "@/lib/styles"
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl
@@ -33,8 +35,56 @@ export interface Chapter {
   blocks: Block[]
 }
 
+/** A file that could not be read at all (corrupt, encrypted, not a PDF). */
+export interface FileFailure {
+  name: string
+  error: string
+}
+
+/** Optional controls for a batch extraction. */
+export interface ExtractOptions {
+  /**
+   * Called once with `done = 0` before the first file, then after each file
+   * finishes (whether it produced a chapter or failed). `currentName` is the
+   * file just finished — or, on the initial call, the one about to start.
+   */
+  onProgress?: (done: number, total: number, currentName: string) => void
+  /** Aborts between files and between pages, rejecting with an `AbortError`. */
+  signal?: AbortSignal
+}
+
+/** Everything one batch extraction learned, including what went wrong. */
+export interface ExtractResult {
+  /** One chapter per successfully read file, in queue order. */
+  chapters: Chapter[]
+  /** Total pages across the files that could be opened. */
+  pageCount: number
+  /** Files skipped because they could not be read; they produce no chapter. */
+  failures: FileFailure[]
+  /** Titles of chapters that yielded no text (typically scanned-image PDFs). */
+  emptyChapters: string[]
+}
+
+/** What a full conversion returns: the EPUB plus everything extraction learned. */
+export interface ConvertResult extends ExtractResult {
+  blob: Blob
+}
+
 function isTextItem(item: unknown): item is TextItem {
   return typeof (item as TextItem).str === "string"
+}
+
+function abortError(): DOMException {
+  return new DOMException("Extraction aborted.", "AbortError")
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortError()
+}
+
+function errorMessage(e: unknown): string {
+  if (e instanceof Error) return e.message
+  return typeof e === "string" ? e : "Unknown error"
 }
 
 /** Derive a chapter title from a file name, e.g. "Chapter 22 (2,509 words).pdf" → "Chapter 22". */
@@ -120,27 +170,110 @@ async function normalizeOcf(epubBlob: Blob, css: string): Promise<Blob> {
   })
 }
 
-/** Reconstruct one PDF file into a titled chapter of blocks. */
-async function pdfFileToChapter(file: File): Promise<Chapter> {
+/**
+ * Reconstruct one PDF file into a titled chapter of blocks, plus its page count.
+ *
+ * Every page's glyphs are collected first (normalized, and reduced to the four
+ * fields reconstruction needs, so the pdf.js objects can be released) and the
+ * whole file is reconstructed at once — cross-page paragraph healing and running
+ * header/footer detection both need to see all the pages together.
+ *
+ * The document is always destroyed and each page released, even on failure:
+ * pdf.js keeps a worker-side copy of every page it has parsed, and a 90-file
+ * batch that never destroys anything will exhaust memory long before the end.
+ */
+async function pdfFileToChapter(
+  file: File,
+  signal?: AbortSignal,
+): Promise<{ chapter: Chapter; pageCount: number }> {
   const bytes = new Uint8Array(await file.arrayBuffer())
   const pdf = await pdfjsLib.getDocument({ data: bytes }).promise
-
-  const blocks: Block[] = []
-  for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
-    const page = await pdf.getPage(pageNum)
-    const content = await page.getTextContent()
-    const items = content.items.filter(isTextItem)
-    blocks.push(...reconstructBlocks(items))
+  try {
+    const pages: Glyph[][] = []
+    for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+      throwIfAborted(signal)
+      const page = await pdf.getPage(pageNum)
+      try {
+        const content = await page.getTextContent()
+        pages.push(
+          content.items.filter(isTextItem).map((it) => ({
+            str: normalizeCharacters(it.str),
+            width: it.width,
+            height: it.height,
+            transform: it.transform,
+          })),
+        )
+      } finally {
+        page.cleanup()
+      }
+    }
+    return {
+      chapter: { title: chapterTitle(file.name), blocks: reconstructChapterBlocks(pages) },
+      pageCount: pdf.numPages,
+    }
+  } finally {
+    await pdf.destroy()
   }
-  return { title: chapterTitle(file.name), blocks }
 }
 
-/** Reconstruct PDF files into chapters (one per file), preserving queue order. */
-export async function pdfToChapters(files: File[]): Promise<Chapter[]> {
+/**
+ * De-hyphenate every chapter against the whole book's vocabulary, in place.
+ * Runs once, after extraction, because the dictionary is the document itself:
+ * a word broken across a page break in chapter 3 is often only corroborated by
+ * an occurrence in chapter 40.
+ */
+function dehyphenateBook(chapters: Chapter[]): void {
+  const blocks = chapters.flatMap((c) => c.blocks)
+  const texts = dehyphenateAll(blocks.map((b) => b.text))
+  blocks.forEach((b, i) => {
+    b.text = texts[i]
+  })
+}
+
+/**
+ * Reconstruct PDF files into chapters (one per file), preserving queue order.
+ *
+ * A file that cannot be read — corrupt, encrypted, not actually a PDF — is
+ * recorded in `failures` and skipped; it never aborts the batch and never
+ * produces a placeholder chapter. A file that reads but yields no text still
+ * becomes a chapter (so the queue and the book stay aligned) and its title is
+ * listed in `emptyChapters`.
+ */
+export async function pdfToChapters(
+  files: File[],
+  options: ExtractOptions = {},
+): Promise<ExtractResult> {
   if (files.length === 0) throw new Error("Add at least one PDF to convert.")
+  const { onProgress, signal } = options
   const chapters: Chapter[] = []
-  for (const file of files) chapters.push(await pdfFileToChapter(file))
-  return chapters
+  const failures: FileFailure[] = []
+  let pageCount = 0
+
+  onProgress?.(0, files.length, files[0].name)
+
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i]
+    throwIfAborted(signal)
+    try {
+      const result = await pdfFileToChapter(file, signal)
+      chapters.push(result.chapter)
+      pageCount += result.pageCount
+    } catch (e) {
+      // An abort is a cancellation of the whole batch, not a bad file.
+      if (signal?.aborted) throw abortError()
+      failures.push({ name: file.name, error: errorMessage(e) })
+    }
+    onProgress?.(i + 1, files.length, file.name)
+  }
+
+  dehyphenateBook(chapters)
+
+  return {
+    chapters,
+    pageCount,
+    failures,
+    emptyChapters: chapters.filter((c) => c.blocks.length === 0).map((c) => c.title),
+  }
 }
 
 /**
@@ -179,25 +312,32 @@ export async function chaptersToEpub(
 }
 
 /**
- * Convert PDF files into a single EPUB — one chapter per file. Returns both the
- * Blob and the reconstructed chapters so the caller can persist the chapters and
- * re-style the EPUB later without re-parsing the PDFs.
+ * Convert PDF files into a single EPUB — one chapter per file. Returns the Blob
+ * alongside the full {@link ExtractResult}, so the caller can persist the
+ * chapters (and re-style later without re-parsing), show the page count without
+ * a second parse, and report which files were skipped.
  *
  * `config` overrides the built-in look, letting the caller convert straight into
- * their saved default style.
+ * their saved default style. `options` threads progress reporting and
+ * cancellation into the extraction.
  */
 export async function pdfToEpub(
   files: File[],
   meta: EpubMetadata,
   config?: StyleConfig,
-): Promise<{ blob: Blob; chapters: Chapter[] }> {
-  const chapters = await pdfToChapters(files)
+  options?: ExtractOptions,
+): Promise<ConvertResult> {
+  const extracted = await pdfToChapters(files, options)
+  if (extracted.chapters.length === 0) {
+    const why = extracted.failures.map((f) => `${f.name}: ${f.error}`).join("; ")
+    throw new Error(`None of the PDFs could be read.${why ? ` (${why})` : ""}`)
+  }
   const blob = await chaptersToEpub(
-    chapters,
+    extracted.chapters,
     meta,
     config ? createStyler(config) : DEFAULT_STYLER,
   )
-  return { blob, chapters }
+  return { ...extracted, blob }
 }
 
 /** Re-render stored chapters into a new EPUB Blob using a custom style config. */
