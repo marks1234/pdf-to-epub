@@ -1,15 +1,23 @@
-import type { KeyboardEvent } from "react"
+import { useRef, useState, type KeyboardEvent } from "react"
 import { useSortable } from "@dnd-kit/sortable"
 import { CSS } from "@dnd-kit/utilities"
-import { FileText, GripVertical, Trash2 } from "lucide-react"
+import { FileText, GripVertical, Pencil, Trash2 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
 import { formatBytes } from "@/lib/format"
+import { chapterTitle } from "@/lib/titles"
 import { cn } from "@/lib/utils"
 
 export interface PdfItem {
   id: string
   file: File
+  /**
+   * Chapter title the user typed for this file. Absent means the title is
+   * derived from the file name, live — so renaming stays correct if the derived
+   * rule changes.
+   */
+  customTitle?: string
 }
 
 /**
@@ -32,6 +40,8 @@ interface SortableFileItemProps {
   dragCount?: number
   onSelect: (e: SelectModifiers) => void
   onRemove: (id: string) => void
+  /** Commit a chapter title; `undefined` reverts to the derived one. */
+  onRename: (id: string, title: string | undefined) => void
   disabled?: boolean
 }
 
@@ -43,6 +53,7 @@ export function SortableFileItem({
   dragCount,
   onSelect,
   onRemove,
+  onRename,
   disabled,
 }: SortableFileItemProps) {
   const {
@@ -59,8 +70,41 @@ export function SortableFileItem({
     transition,
   }
 
+  const derived = chapterTitle(item.file.name)
+  const title = item.customTitle?.trim() || derived
+
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(title)
+  /** Set by Escape so the blur that follows does not commit the abandoned draft. */
+  const cancelled = useRef(false)
+
+  const startEditing = () => {
+    cancelled.current = false
+    setDraft(title)
+    setEditing(true)
+  }
+
+  const commit = () => {
+    if (cancelled.current) return
+    setEditing(false)
+    const next = draft.trim()
+    // Typing the derived title back is the same as having no custom title.
+    onRename(item.id, !next || next === derived ? undefined : next)
+  }
+
+  const handleDraftKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter") {
+      e.preventDefault()
+      commit()
+    } else if (e.key === "Escape") {
+      e.preventDefault()
+      cancelled.current = true
+      setEditing(false)
+    }
+  }
+
   const handleKeyDown = (e: KeyboardEvent<HTMLLIElement>) => {
-    // Ignore keys aimed at the drag handle or the remove button.
+    // Ignore keys aimed at the drag handle, the title input or the buttons.
     if (e.target !== e.currentTarget) return
     if (e.key !== " " && e.key !== "Enter") return
     e.preventDefault()
@@ -112,7 +156,47 @@ export function SortableFileItem({
 
       <div className="min-w-0 flex-1">
         <p className="truncate text-sm font-medium">{item.file.name}</p>
-        <p className="text-xs text-muted-foreground">{formatBytes(item.file.size)}</p>
+        {editing ? (
+          <Input
+            autoFocus
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={handleDraftKeyDown}
+            onBlur={commit}
+            onClick={(e) => e.stopPropagation()}
+            aria-label={`Chapter title for ${item.file.name}`}
+            className="mt-1 h-7 text-xs"
+          />
+        ) : (
+          <div className="flex items-center gap-1">
+            <p className="truncate text-xs text-muted-foreground">
+              <span
+                className={cn(item.customTitle && "font-medium text-foreground")}
+                title={
+                  item.customTitle
+                    ? `Custom title (derived: ${derived})`
+                    : "Derived from the file name"
+                }
+              >
+                {title}
+              </span>
+              {" · "}
+              {formatBytes(item.file.size)}
+            </p>
+            <button
+              type="button"
+              className="shrink-0 rounded-sm p-0.5 text-muted-foreground opacity-70 transition-opacity hover:opacity-100 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none disabled:pointer-events-none disabled:opacity-40"
+              aria-label={`Edit chapter title for ${item.file.name}`}
+              disabled={disabled}
+              onClick={(e) => {
+                e.stopPropagation()
+                startEditing()
+              }}
+            >
+              <Pencil className="size-3" />
+            </button>
+          </div>
+        )}
       </div>
 
       <Button

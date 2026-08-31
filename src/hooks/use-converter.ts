@@ -35,7 +35,14 @@ function abortError(): DOMException {
 }
 
 type Job =
-  | { kind: "convert"; files: File[]; meta: EpubMetadata; config?: StyleConfig }
+  | {
+      kind: "convert"
+      files: File[]
+      meta: EpubMetadata
+      config?: StyleConfig
+      /** Chapter titles, index-aligned with `files`; blanks derive from the name. */
+      titles?: (string | undefined)[]
+    }
   | {
       kind: "restyle"
       chapters: Chapter[]
@@ -111,6 +118,7 @@ export function useConverter() {
               ? pdfToEpub(job.files, job.meta, job.config, {
                   onProgress: report,
                   signal: controller.signal,
+                  titles: job.titles,
                 })
               : // Re-styling has no cancellable seam; a cancel just stops
                 // waiting for it.
@@ -202,6 +210,7 @@ export function useConverter() {
               files: job.files,
               meta: job.meta,
               config: job.config,
+              titles: job.titles,
             }
           : {
               type: "restyle",
@@ -214,10 +223,19 @@ export function useConverter() {
     })
   }, [])
 
-  /** Convert a batch of PDFs; rejects with an `AbortError` if cancelled. */
+  /**
+   * Convert a batch of PDFs; rejects with an `AbortError` if cancelled.
+   *
+   * `titles` (index-aligned with `files`) overrides the name-derived chapter
+   * titles; leave an entry undefined to keep the derived one.
+   */
   const convert = useCallback(
-    (files: File[], meta: EpubMetadata, config?: StyleConfig) =>
-      run({ kind: "convert", files, meta, config }),
+    (
+      files: File[],
+      meta: EpubMetadata,
+      config?: StyleConfig,
+      titles?: (string | undefined)[],
+    ) => run({ kind: "convert", files, meta, config, titles }),
     [run],
   )
 

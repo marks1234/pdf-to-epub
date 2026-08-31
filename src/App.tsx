@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useMemo, useRef, useState } from "react"
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useDropzone } from "react-dropzone"
 import {
   DndContext,
@@ -26,6 +26,8 @@ import {
   Loader2,
   Merge,
   Palette,
+  Pencil,
+  RotateCcw,
   TriangleAlert,
   Trash2,
   UploadCloud,
@@ -40,21 +42,29 @@ import {
   type PdfItem,
   type SelectModifiers,
 } from "@/components/sortable-file-item"
+import { BookDetails, type BookDetailsValue } from "@/components/book-details"
 import { MemoField } from "@/components/memo-field"
+import { RenameDialog } from "@/components/rename-dialog"
 import { StyleEditor } from "@/components/style-editor"
 import { ThemeToggle } from "@/components/theme-toggle"
 import { cn } from "@/lib/utils"
 import { mergePdfs, countPages } from "@/lib/merge-pdf"
-import type { FileFailure } from "@/lib/pdf-to-epub"
+import type { EpubMetadata, FileFailure } from "@/lib/pdf-to-epub"
 import { downloadBlob } from "@/lib/download"
 import { formatBytes, formatDate, sanitizeFilename } from "@/lib/format"
 import { moveGroup, rangeIds } from "@/lib/reorder"
+import { kindleSeriesTitle } from "@/lib/titles"
 import {
   DEFAULT_STYLE_CONFIG,
   validateStyleConfig,
   type StyleConfig,
 } from "@/lib/styles"
-import { HISTORY_CAP, type OutputRecord } from "@/lib/storage"
+import {
+  HISTORY_CAP,
+  type OutputRecord,
+  type QueueDetails,
+  type StoredBookMeta,
+} from "@/lib/storage"
 import {
   analyzeSequence,
   extractNumber,
@@ -64,6 +74,7 @@ import {
 import { isAbortError, useConverter } from "@/hooks/use-converter"
 import { useNameMemory } from "@/hooks/use-name-memory"
 import { useOutputs } from "@/hooks/use-outputs"
+import { useQueuePersistence } from "@/hooks/use-queue-persistence"
 import { useStyleProfiles } from "@/hooks/use-style-profiles"
 import { useTheme } from "@/hooks/use-theme"
 
@@ -120,12 +131,79 @@ function byNaturalName(a: PdfItem, b: PdfItem): number {
   })
 }
 
+const EMPTY_BOOK_DETAILS: BookDetailsValue = {
+  series: "",
+  seriesIndex: null,
+  language: "",
+  description: "",
+  cover: null,
+  kindleSeriesTitle: false,
+}
+
+/** Blank fields stay out of the metadata entirely rather than writing "". */
+function orUndefined(value: string): string | undefined {
+  return value.trim() || undefined
+}
+
+/**
+ * The `dc:title` to write. With the Kindle option on, the series name and a
+ * zero-padded index lead the title so title-sort keeps sideloaded volumes of one
+ * series together. The *download filename* deliberately keeps the plain title.
+ */
+function epubTitleFor(title: string, details: BookDetailsValue): string {
+  const series = details.series.trim()
+  if (!details.kindleSeriesTitle || !series || details.seriesIndex == null) {
+    return title
+  }
+  return kindleSeriesTitle(series, details.seriesIndex, title)
+}
+
+/** Snapshot the book details an EPUB build consumes, to store with the output. */
+function bookMetaFor(title: string, details: BookDetailsValue): StoredBookMeta {
+  return {
+    language: orUndefined(details.language),
+    description: orUndefined(details.description),
+    series: orUndefined(details.series),
+    seriesIndex: details.seriesIndex ?? undefined,
+    cover: details.cover ?? undefined,
+    epubTitle: epubTitleFor(title, details),
+  }
+}
+
+/**
+ * Expand a stored snapshot into the metadata a build wants. Shared by the first
+ * conversion and every later re-style, so a re-style cannot quietly drop the
+ * cover, language or series the book was made with. Records saved before the
+ * snapshot existed fall back to title and author alone.
+ */
+function epubMetaFrom(
+  meta: StoredBookMeta | undefined,
+  title: string,
+  author: string,
+  identifier: string,
+): EpubMetadata {
+  return {
+    title: meta?.epubTitle || title,
+    author: author || "Unknown",
+    language: meta?.language,
+    description: meta?.description,
+    series: meta?.series,
+    seriesIndex: meta?.seriesIndex,
+    cover: meta?.cover,
+    identifier,
+  }
+}
+
 export default function App() {
   const [items, setItems] = useState<PdfItem[]>([])
   const [title, setTitle] = useState("Merged Document")
   const [author, setAuthor] = useState("")
+  const [details, setDetails] = useState<BookDetailsValue>(EMPTY_BOOK_DETAILS)
   const [busy, setBusy] = useState<Busy>("idle")
   const [error, setError] = useState<string | null>(null)
+
+  /** Open state of the bulk-rename dialog. */
+  const [renaming, setRenaming] = useState(false)
 
   /** Files ignored on the last drop because they were already queued. */
   const [skippedDupes, setSkippedDupes] = useState(0)
@@ -159,6 +237,53 @@ export default function App() {
   const [styling, setStyling] = useState<OutputRecord | null>(null)
   const [restyleBusy, setRestyleBusy] = useState(false)
 
+  const patchDetails = useCallback(
+    (patch: Partial<BookDetailsValue>) =>
+      setDetails((prev) => ({ ...prev, ...patch })),
+    [],
+  )
+
+  // Persisted alongside the queue so a reload keeps the whole book setup, not
+  // just the files. Memoized because the persistence effect debounces on it.
+  const queueDetails = useMemo<QueueDetails>(
+    () => ({
+      title,
+      author,
+      language: orUndefined(details.language),
+      description: orUndefined(details.description),
+      series: orUndefined(details.series),
+      seriesIndex: details.seriesIndex ?? undefined,
+      cover: details.cover ?? undefined,
+      kindleSeriesTitle: details.kindleSeriesTitle || undefined,
+    }),
+    [title, author, details],
+  )
+
+  const restoreQueue = useCallback(
+    (restored: PdfItem[], saved: QueueDetails) => {
+      setItems(restored)
+      if (saved.title) setTitle(saved.title)
+      if (saved.author) setAuthor(saved.author)
+      setDetails({
+        series: saved.series ?? "",
+        seriesIndex: saved.seriesIndex ?? null,
+        language: saved.language ?? "",
+        description: saved.description ?? "",
+        cover: saved.cover ?? null,
+        kindleSeriesTitle: saved.kindleSeriesTitle ?? false,
+      })
+    },
+    [],
+  )
+
+  const queue = useQueuePersistence({
+    items,
+    details: queueDetails,
+    // A conversion neither changes the queue nor should be landed on top of.
+    busy: busy !== "idle",
+    onRestore: restoreQueue,
+  })
+
   const applyStyle = async (out: OutputRecord, config: StyleConfig) => {
     setError(null)
     setRestyleBusy(true)
@@ -169,9 +294,11 @@ export default function App() {
       if (!chapters) return
       // The record's id doubles as the book's stable `dc:identifier`, so a
       // re-styled book replaces the old one on a device instead of joining it.
+      // The stored `meta` snapshot carries language, series, description and the
+      // cover across, so a re-style is not a quiet metadata reset.
       const blob = await converter.restyle(
         chapters,
-        { title: out.title, author: out.author || "Unknown" },
+        epubMetaFrom(out.meta, out.title, out.author, out.id),
         config,
         out.id,
       )
@@ -314,6 +441,34 @@ export default function App() {
     setAnchor(null)
   }
 
+  /** Rebuild one item with (or without) a custom chapter title. */
+  const withTitle = (item: PdfItem, customTitle: string | undefined): PdfItem =>
+    customTitle ? { id: item.id, file: item.file, customTitle } : { id: item.id, file: item.file }
+
+  const renameItem = (id: string, customTitle: string | undefined) =>
+    setItems((prev) =>
+      prev.map((item) => (item.id === id ? withTitle(item, customTitle) : item)),
+    )
+
+  /** Rows a bulk rename applies to: the selection when there is one, else all. */
+  const renameTargets = useMemo(
+    () => (selected.size > 0 ? items.filter((i) => selected.has(i.id)) : items),
+    [items, selected],
+  )
+
+  /** Apply one title per rename target; `titles` is index-aligned with them. */
+  const applyBulkRename = (titles: string[]) => {
+    const byId = new Map(renameTargets.map((item, i) => [item.id, titles[i] ?? ""]))
+    setItems((prev) =>
+      prev.map((item) => {
+        const next = byId.get(item.id)
+        // Untargeted rows, and rows the pattern emptied, keep what they had.
+        if (next === undefined || !next.trim()) return item
+        return withTitle(item, next.trim())
+      }),
+    )
+  }
+
   const autoOrder = () =>
     setItems((prev) =>
       [...prev].sort((a, b) => {
@@ -382,23 +537,29 @@ export default function App() {
       `Converting ${files.length} file${files.length === 1 ? "" : "s"}…`,
     )
 
+    // Minted up front so the very first build already carries the identifier
+    // every later re-style reuses — one book to a device, not a new one each time.
+    const id = crypto.randomUUID()
+    const bookTitle = title || "Merged Document"
+    const meta = bookMetaFor(bookTitle, details)
+
     try {
       // Extraction already counts every page it opens, so the separate
       // countPages() parse of the whole batch is pure duplicated work.
       const result = await converter.convert(
         files,
-        {
-          title: title || "Merged Document",
-          author: author || "Unknown",
-        },
+        epubMetaFrom(meta, bookTitle, author, id),
         defaultStyle,
+        items.map((i) => i.customTitle?.trim() || undefined),
       )
       await history.add({
-        id: crypto.randomUUID(),
+        id,
         kind: "epub",
+        // The filename keeps the plain title even when dc:title is the Kindle
+        // series-sort form.
         filename: `${sanitizeFilename(title || "merged")}.epub`,
         blob: result.blob,
-        title: title || "Merged Document",
+        title: bookTitle,
         author,
         sources: files.map((f) => f.name),
         pageCount: result.pageCount,
@@ -406,6 +567,7 @@ export default function App() {
         createdAt: Date.now(),
         chapters: result.chapters,
         style: defaultStyle,
+        meta,
       })
       rememberNames()
       if (result.failures.length > 0 || result.emptyChapters.length > 0) {
@@ -566,6 +728,44 @@ export default function App() {
               />
             </div>
 
+            {/* Optional metadata: series, language, description, cover */}
+            <BookDetails
+              value={details}
+              onChange={patchDetails}
+              title={title || "Merged Document"}
+              disabled={isBusy}
+            />
+
+            {/* Queue restored from the last session */}
+            {queue.restoredCount > 0 && (
+              <div className="flex shrink-0 items-start gap-2 rounded-lg border bg-muted/50 px-3 py-2 text-sm">
+                <RotateCcw className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+                <p className="flex-1">
+                  Restored {queue.restoredCount} file
+                  {queue.restoredCount === 1 ? "" : "s"} from your last session.
+                </p>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="-my-1 h-7 shrink-0"
+                  onClick={() => {
+                    clearAll()
+                    void queue.clear()
+                  }}
+                >
+                  Clear
+                </Button>
+                <button
+                  type="button"
+                  onClick={queue.dismissRestore}
+                  aria-label="Dismiss restored queue notice"
+                  className="-mr-1 shrink-0 rounded-sm p-0.5 opacity-70 transition-opacity hover:opacity-100 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+                >
+                  <X className="size-4" />
+                </button>
+              </div>
+            )}
+
             {/* Toolbar */}
             {hasFiles && (
               <div className="flex shrink-0 items-center justify-between gap-2">
@@ -597,6 +797,15 @@ export default function App() {
                       </Button>
                     </>
                   )}
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setRenaming(true)}
+                    disabled={isBusy}
+                  >
+                    <Pencil className="size-4" />
+                    Rename {selected.size > 0 ? "selected" : "all"}
+                  </Button>
                   <Button
                     variant="outline"
                     size="sm"
@@ -767,6 +976,7 @@ export default function App() {
                                 handleSelect(index, item.id, e)
                               }
                               onRemove={removeItem}
+                              onRename={renameItem}
                               disabled={isBusy}
                             />
                             {gap && (
@@ -985,6 +1195,16 @@ export default function App() {
           </div>
         </section>
       </main>
+
+      {renaming && (
+        <RenameDialog
+          open={renaming}
+          onOpenChange={setRenaming}
+          targets={renameTargets.map((i) => i.file.name)}
+          selectionOnly={selected.size > 0}
+          onApply={applyBulkRename}
+        />
+      )}
 
       {styling && (
         <StyleEditor

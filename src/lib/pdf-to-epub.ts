@@ -5,7 +5,7 @@ import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url"
 import jEpub from "jepub"
 
 import { normalizeOcf } from "@/lib/epub-normalize"
-import { extractNumber } from "@/lib/sequence"
+import { chapterTitle } from "@/lib/titles"
 import {
   DEFAULT_STYLER,
   blocksToHtml,
@@ -17,6 +17,11 @@ import { dehyphenateAll, normalizeCharacters } from "@/lib/cleanup"
 import { createStyler, type StyleConfig, type Styler } from "@/lib/styles"
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl
+
+// The filename→title derivation lives in `titles.ts` (a dependency-free module
+// the UI can import without pulling this whole pipeline into the main bundle),
+// but it is part of this module's public surface.
+export { chapterTitle } from "@/lib/titles"
 
 export interface EpubMetadata {
   title: string
@@ -81,6 +86,12 @@ export interface ExtractOptions {
   onProgress?: (done: number, total: number, currentName: string) => void
   /** Aborts between files and between pages, rejecting with an `AbortError`. */
   signal?: AbortSignal
+  /**
+   * Chapter titles, index-aligned with `files`. An entry that is undefined (or
+   * blank) falls back to {@link chapterTitle} on that file's name, so a partly
+   * filled array is fine — pass only the ones the user renamed.
+   */
+  titles?: (string | undefined)[]
 }
 
 /** Everything one batch extraction learned, including what went wrong. */
@@ -117,22 +128,11 @@ function errorMessage(e: unknown): string {
   return typeof e === "string" ? e : "Unknown error"
 }
 
-/** Derive a chapter title from a file name, e.g. "Chapter 22 (2,509 words).pdf" → "Chapter 22". */
-function chapterTitle(filename: string): string {
-  const { num, label } = extractNumber(filename)
-  if (label && num !== null) return `${label} ${num}`
-
-  const base = filename.replace(/\.[^.]+$/, "")
-  const cleaned = base
-    .replace(/\s*\([^)]*\)\s*/g, " ") // drop "(2,509 words)"-style notes
-    .replace(/[_-]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-  return cleaned || base
-}
-
 /**
  * Reconstruct one PDF file into a titled chapter of blocks, plus its page count.
+ *
+ * `title` overrides the name-derived chapter title when it holds anything but
+ * whitespace.
  *
  * Every page's glyphs are collected first (normalized, and reduced to the four
  * fields reconstruction needs, so the pdf.js objects can be released) and the
@@ -146,6 +146,7 @@ function chapterTitle(filename: string): string {
 async function pdfFileToChapter(
   file: File,
   signal?: AbortSignal,
+  title?: string,
 ): Promise<{ chapter: Chapter; pageCount: number }> {
   const bytes = new Uint8Array(await file.arrayBuffer())
   const pdf = await pdfjsLib.getDocument({ data: bytes }).promise
@@ -169,7 +170,10 @@ async function pdfFileToChapter(
       }
     }
     return {
-      chapter: { title: chapterTitle(file.name), blocks: reconstructChapterBlocks(pages) },
+      chapter: {
+        title: title?.trim() || chapterTitle(file.name),
+        blocks: reconstructChapterBlocks(pages),
+      },
       pageCount: pdf.numPages,
     }
   } finally {
@@ -199,13 +203,16 @@ function dehyphenateBook(chapters: Chapter[]): void {
  * produces a placeholder chapter. A file that reads but yields no text still
  * becomes a chapter (so the queue and the book stay aligned) and its title is
  * listed in `emptyChapters`.
+ *
+ * `options.titles` overrides the name-derived chapter titles, index-aligned
+ * with `files`.
  */
 export async function pdfToChapters(
   files: File[],
   options: ExtractOptions = {},
 ): Promise<ExtractResult> {
   if (files.length === 0) throw new Error("Add at least one PDF to convert.")
-  const { onProgress, signal } = options
+  const { onProgress, signal, titles } = options
   const chapters: Chapter[] = []
   const failures: FileFailure[] = []
   let pageCount = 0
@@ -216,7 +223,7 @@ export async function pdfToChapters(
     const file = files[i]
     throwIfAborted(signal)
     try {
-      const result = await pdfFileToChapter(file, signal)
+      const result = await pdfFileToChapter(file, signal, titles?.[i])
       chapters.push(result.chapter)
       pageCount += result.pageCount
     } catch (e) {
