@@ -11,6 +11,7 @@ import {
   DEFAULT_STYLE_CONFIG,
   type Styler,
 } from "@/lib/styles"
+import { isSceneBreak, stripRunningHeadersFooters } from "@/lib/cleanup"
 
 /** The built-in styler; rendering uses this unless a custom one is passed. */
 export const DEFAULT_STYLER: Styler = createStyler(DEFAULT_STYLE_CONFIG)
@@ -47,9 +48,14 @@ export interface ReconstructedLine {
   text: string
 }
 
-/** A block of output: a list item (`li`) or a normal paragraph (`p`). */
+/**
+ * A block of output: a list item (`li`), a normal paragraph (`p`), or a scene
+ * break (`hr`) — a `* * *` / `◇◇◇` divider recognized as semantic markup rather
+ * than left as a paragraph of punctuation. An `hr` block keeps the original
+ * divider text so stored chapters round-trip losslessly; nothing renders it.
+ */
 export interface Block {
-  type: "p" | "li"
+  type: "p" | "li" | "hr"
   text: string
 }
 
@@ -104,35 +110,63 @@ export function assembleBlocks(lines: ReconstructedLine[]): Block[] {
 }
 
 /**
- * Reconstruct readable blocks from pdf.js glyph fragments. Groups fragments into
- * lines by baseline Y, inserts a space only at real horizontal gaps, then
- * assembles wrapped lines into paragraphs and bullet runs into list items.
+ * Group pdf.js glyph fragments into lines by baseline Y and read each line out
+ * left-to-right, inserting a space only at real horizontal gaps.
+ *
+ * Grouping is linear: fragments are bucketed by `round(y / maxHeight)` in a Map
+ * instead of scanning every known line per fragment (which was O(n²) and the
+ * dominant cost on text-dense pages). Because the merge tolerance is at most
+ * `maxHeight / 2`, two fragments that belong together can differ by at most one
+ * bucket, so checking the bucket and its two neighbours is exhaustive. The
+ * ±tolerance test itself is unchanged, and ties still resolve to the
+ * earliest-created line, so output is identical to the old scan.
  */
-export function reconstructBlocks(items: Glyph[]): Block[] {
+export function reconstructLines(items: Glyph[]): ReconstructedLine[] {
   const fragments = items.filter((it) => it.str.trim() !== "" || it.width > 0)
   if (fragments.length === 0) return []
 
   interface Line {
+    seq: number
     y: number
     height: number
     items: Glyph[]
   }
+
+  let maxHeight = 1
+  for (const it of fragments) maxHeight = Math.max(maxHeight, it.height || 10)
+
   const lines: Line[] = []
+  const buckets = new Map<number, Line[]>()
   for (const it of fragments) {
     const y = it.transform[5]
     const h = it.height || 10
-    const line = lines.find((l) => Math.abs(l.y - y) <= Math.max(l.height, h) * 0.5)
-    if (line) {
-      line.items.push(it)
-      line.height = Math.max(line.height, h)
+    const key = Math.round(y / maxHeight)
+
+    let best: Line | null = null
+    for (let k = key - 1; k <= key + 1; k++) {
+      const bucket = buckets.get(k)
+      if (!bucket) continue
+      for (const l of bucket) {
+        if (best !== null && l.seq > best.seq) continue
+        if (Math.abs(l.y - y) <= Math.max(l.height, h) * 0.5) best = l
+      }
+    }
+
+    if (best) {
+      best.items.push(it)
+      best.height = Math.max(best.height, h)
     } else {
-      lines.push({ y, height: h, items: [it] })
+      const line: Line = { seq: lines.length, y, height: h, items: [it] }
+      lines.push(line)
+      const bucket = buckets.get(key)
+      if (bucket) bucket.push(line)
+      else buckets.set(key, [line])
     }
   }
 
   lines.sort((a, b) => b.y - a.y)
 
-  const lineTexts: ReconstructedLine[] = lines
+  return lines
     .map((line) => {
       const sorted = [...line.items].sort(
         (a, b) => a.transform[4] - b.transform[4],
@@ -153,8 +187,82 @@ export function reconstructBlocks(items: Glyph[]): Block[] {
       return { y: line.y, height: line.height, text: text.replace(/\s+/g, " ").trim() }
     })
     .filter((l) => l.text)
+}
 
-  return assembleBlocks(lineTexts)
+/**
+ * Reconstruct readable blocks from one page's glyph fragments: lines by
+ * baseline Y, then wrapped lines assembled into paragraphs and bullet runs into
+ * list items. For a whole file use {@link reconstructChapterBlocks}, which also
+ * strips running headers and stitches paragraphs across page boundaries.
+ */
+export function reconstructBlocks(items: Glyph[]): Block[] {
+  return assembleBlocks(reconstructLines(items))
+}
+
+// ── Page stitching ───────────────────────────────────────────────────────────
+
+/**
+ * Ends a sentence — so the next block is a new paragraph even if it starts
+ * lowercase. Closing quotes and brackets count: dialogue often ends `…," she`.
+ */
+const SENTENCE_END_RE = /[.!?…"”’'\]]\s*$/
+/** A continuation of the previous page's paragraph starts mid-sentence. */
+const CONTINUATION_RE = /^\p{Ll}/u
+
+/** Tag divider blocks (`* * *`, `◇◇◇`) as semantic scene breaks. */
+export function markSceneBreaks(blocks: Block[]): Block[] {
+  return blocks.map((b) =>
+    b.type === "p" && isSceneBreak(b.text) ? { type: "hr" as const, text: b.text } : b,
+  )
+}
+
+/**
+ * Concatenate per-page blocks into one chapter, healing paragraphs that a page
+ * break cut in half: the last block of a page and the first of the next are
+ * joined when the first does not end a sentence and the second starts with a
+ * lowercase letter — the same wrap heuristic {@link assembleBlocks} uses inside
+ * a page. Only prose (`p`) blocks are ever joined; list items and scene breaks
+ * stay separate.
+ *
+ * Running headers/footers must already be gone (see `stripRunningHeadersFooters`),
+ * or a page number would sit between the two halves and block the join.
+ */
+export function mergePageBlocks(pages: Block[][]): Block[] {
+  const out: Block[] = []
+  for (const page of pages) {
+    if (page.length === 0) continue
+    const prev = out[out.length - 1]
+    const first = page[0]
+    const continues =
+      prev !== undefined &&
+      prev.type === "p" &&
+      first.type === "p" &&
+      !SENTENCE_END_RE.test(prev.text) &&
+      CONTINUATION_RE.test(first.text)
+    if (continues) {
+      out[out.length - 1] = { ...prev, text: `${prev.text} ${first.text}` }
+      for (let i = 1; i < page.length; i++) out.push(page[i])
+    } else {
+      for (const block of page) out.push(block)
+    }
+  }
+  return out
+}
+
+/**
+ * Full per-file reconstruction: every page's glyphs in, one chapter's blocks
+ * out. Pure (no pdf.js), so the whole cross-page pipeline is unit-testable.
+ *
+ * Order matters. Headers/footers are removed while line data is still per-page
+ * (that is the only place their position is knowable) and before the pages are
+ * stitched, so a running footer can't wedge itself between the two halves of a
+ * split paragraph. Scene breaks are tagged before stitching too, so a divider
+ * at a page edge is never swallowed by the paragraph after it.
+ */
+export function reconstructChapterBlocks(pages: Glyph[][]): Block[] {
+  const pageLines = stripRunningHeadersFooters(pages.map(reconstructLines))
+  const pageBlocks = pageLines.map((lines) => markSceneBreaks(assembleBlocks(lines)))
+  return mergePageBlocks(pageBlocks)
 }
 
 // ── Stat-sheet detection & rendering ─────────────────────────────────────────
@@ -242,6 +350,7 @@ function isLabeledFieldBlock(text: string): boolean {
 
 /** A block that belongs in a stat sheet rather than the prose flow. */
 function isStatLike(b: Block): boolean {
+  if (b.type === "hr") return false
   if (b.type === "li") return true
   const t = b.text
   return bracketCount(t) >= 2 || /\d%/.test(t) || STAT_LABEL_RE.test(t) || isLabeledFieldBlock(t)
@@ -281,7 +390,8 @@ function renderStatList(items: string[], styler: Styler): string {
  * render as a styled `<ul>`, and field lines (de-glued where needed) render as
  * `<div class="stat-line">`, all with rarity / keyword / percentage coloring.
  * Ordinary prose stays a plain `<p>` — only percentages are colored there (the
- * user wants every percentage colored), never the keyword/box styling.
+ * user wants every percentage colored), never the keyword/box styling. A scene
+ * break renders as `<hr class="scene-break" />`.
  *
  * Passing a custom styler is how the Style Editor re-renders an EPUB.
  */
@@ -291,6 +401,13 @@ export function blocksToHtml(blocks: Block[], styler: Styler = DEFAULT_STYLER): 
   let i = 0
 
   while (i < blocks.length) {
+    if (blocks[i].type === "hr") {
+      // Self-closing and class-only: the stylesheet lives in styles.ts, and an
+      // unstyled <hr> already reads as a divider on Kindle.
+      out.push('<hr class="scene-break" />')
+      i++
+      continue
+    }
     if (!isStatLike(blocks[i])) {
       out.push(prose(blocks[i].text))
       i++
