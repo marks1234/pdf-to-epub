@@ -48,7 +48,11 @@ import { pdfToEpub, restyleEpub } from "@/lib/pdf-to-epub"
 import { downloadBlob } from "@/lib/download"
 import { formatBytes, formatDate, sanitizeFilename } from "@/lib/format"
 import { moveGroup, rangeIds } from "@/lib/reorder"
-import { DEFAULT_STYLE_CONFIG, type StyleConfig } from "@/lib/styles"
+import {
+  DEFAULT_STYLE_CONFIG,
+  validateStyleConfig,
+  type StyleConfig,
+} from "@/lib/styles"
 import { HISTORY_CAP, type OutputRecord } from "@/lib/storage"
 import {
   analyzeSequence,
@@ -82,9 +86,7 @@ function loadDefaultStyle(): StyleConfig {
   try {
     const raw = localStorage.getItem(DEFAULT_STYLE_KEY)
     if (!raw) return DEFAULT_STYLE_CONFIG
-    const parsed = JSON.parse(raw) as StyleConfig
-    if (!parsed || !Array.isArray(parsed.rarities)) return DEFAULT_STYLE_CONFIG
-    return parsed
+    return validateStyleConfig(JSON.parse(raw)) ?? DEFAULT_STYLE_CONFIG
   } catch {
     return DEFAULT_STYLE_CONFIG
   }
