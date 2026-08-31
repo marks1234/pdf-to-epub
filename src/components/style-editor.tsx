@@ -66,9 +66,9 @@ const PREVIEW_BLOCKS: Block[] = [
   { type: "p", text: "Build Condition 100%" },
 ]
 
-function previewHtml(config: StyleConfig): string {
+function previewHtml(config: StyleConfig, blocks: Block[] = PREVIEW_BLOCKS): string {
   const styler = createStyler(config)
-  const body = blocksToHtml(PREVIEW_BLOCKS, styler)
+  const body = blocksToHtml(blocks.length > 0 ? blocks : PREVIEW_BLOCKS, styler)
   const panel = (bg: string, fg: string, label: string) =>
     `<div style="background:${bg};color:${fg};padding:10px 14px;border-radius:10px;margin-bottom:10px;">
       <div style="font:600 10px sans-serif;letter-spacing:.08em;text-transform:uppercase;opacity:.5;margin-bottom:6px">${label}</div>
@@ -339,6 +339,12 @@ export interface StyleEditorProps {
   applyLabel?: string
   /** Footer hint shown while idle; defaults to the per-EPUB wording. */
   hint?: string
+  /**
+   * An excerpt of the real book to preview with (see `pickSampleBlocks`). Left
+   * out — or empty, while the chapters are still loading — the built-in sample
+   * stat sheet is shown instead, which is all the default-style editor has.
+   */
+  sampleBlocks?: Block[]
 }
 
 export function StyleEditor({
@@ -354,6 +360,7 @@ export function StyleEditor({
   onDeleteProfile,
   applyLabel = "Apply to EPUB",
   hint = "Changes apply to this EPUB.",
+  sampleBlocks,
 }: StyleEditorProps) {
   const [config, setConfig] = useState<StyleConfig>(() =>
     cloneConfig(initialConfig ?? DEFAULT_STYLE_CONFIG),
@@ -369,7 +376,11 @@ export function StyleEditor({
     if (open) setConfig(cloneConfig(initialConfig ?? DEFAULT_STYLE_CONFIG))
   }, [open, initialConfig])
 
-  const preview = useMemo(() => previewHtml(config), [config])
+  const preview = useMemo(
+    () => previewHtml(config, sampleBlocks),
+    [config, sampleBlocks],
+  )
+  const usingBook = !!sampleBlocks && sampleBlocks.length > 0
   const audit = useMemo(() => auditStyleConfig(config), [config])
   const checkFor = (scope: AuditEntry["scope"], key: string): ColorCheck | undefined =>
     audit.entries.find((e) => e.scope === scope && e.key === key)?.check
@@ -744,6 +755,9 @@ export function StyleEditor({
           <div className="flex min-h-0 flex-col bg-muted/30">
             <div className="shrink-0 px-3 py-2 text-xs font-medium text-muted-foreground">
               Live preview
+              <span className="ml-1 font-normal opacity-80">
+                {usingBook ? "— from this book" : "— sample stat sheet"}
+              </span>
             </div>
             <iframe
               title="Style preview"

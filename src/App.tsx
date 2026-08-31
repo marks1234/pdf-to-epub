@@ -20,6 +20,7 @@ import {
   BookOpen,
   CheckCircle2,
   Download,
+  Eye,
   FileText,
   HardDriveDownload,
   Inbox,
@@ -43,6 +44,7 @@ import {
   type SelectModifiers,
 } from "@/components/sortable-file-item"
 import { BookDetails, type BookDetailsValue } from "@/components/book-details"
+import { BookPreview } from "@/components/book-preview"
 import { MemoField } from "@/components/memo-field"
 import { RenameDialog } from "@/components/rename-dialog"
 import { StyleEditor } from "@/components/style-editor"
@@ -52,6 +54,8 @@ import { mergePdfs, countPages } from "@/lib/merge-pdf"
 import type { EpubMetadata, FileFailure } from "@/lib/pdf-to-epub"
 import { downloadBlob } from "@/lib/download"
 import { formatBytes, formatDate, sanitizeFilename } from "@/lib/format"
+import { pickSampleBlocks } from "@/lib/preview-sample"
+import type { Block } from "@/lib/reconstruct"
 import { moveGroup, rangeIds } from "@/lib/reorder"
 import { kindleSeriesTitle } from "@/lib/titles"
 import {
@@ -214,7 +218,7 @@ export default function App() {
   /** Screen-reader announcements for selection and long-running work. */
   const [announcement, setAnnouncement] = useState("")
 
-  const { theme, cycleTheme } = useTheme()
+  const { theme, isDark, cycleTheme } = useTheme()
 
   /** Multi-select in the queue: ids, the last plainly-clicked row, the live drag. */
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set())
@@ -236,6 +240,35 @@ export default function App() {
 
   const [styling, setStyling] = useState<OutputRecord | null>(null)
   const [restyleBusy, setRestyleBusy] = useState(false)
+  /** The EPUB being read in the preview dialog. */
+  const [previewing, setPreviewing] = useState<OutputRecord | null>(null)
+  /**
+   * An excerpt of the book the Style editor is open on, so the live preview
+   * shows that book's own stat sheets instead of the canned sample. Undefined
+   * while the chapters load (and for the default-style editor, which has none).
+   */
+  const [styleSample, setStyleSample] = useState<Block[] | undefined>(undefined)
+
+  const { loadChapters } = history
+  const stylingId = styling?.hasChapters ? styling.id : null
+
+  useEffect(() => {
+    setStyleSample(undefined)
+    if (!stylingId) return
+    let active = true
+    loadChapters(stylingId)
+      .then((chapters) => {
+        if (!active) return
+        const sample = pickSampleBlocks(chapters)
+        if (sample.length > 0) setStyleSample(sample)
+      })
+      .catch(() => {
+        // Not fatal — the editor just keeps showing its built-in sample.
+      })
+    return () => {
+      active = false
+    }
+  }, [stylingId, loadChapters])
 
   const patchDetails = useCallback(
     (patch: Partial<BookDetailsValue>) =>
@@ -1159,6 +1192,18 @@ export default function App() {
                       </div>
                     </div>
                     <div className="mt-3 flex justify-end gap-2">
+                      {/* Both need the stored chapter text: one to re-render it,
+                          the other to re-style it. */}
+                      {out.kind === "epub" && out.hasChapters && (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => setPreviewing(out)}
+                        >
+                          <Eye className="size-4" />
+                          Preview
+                        </Button>
+                      )}
                       {out.kind === "epub" && (
                         <Button
                           variant="outline"
@@ -1206,6 +1251,19 @@ export default function App() {
         />
       )}
 
+      {previewing && (
+        <BookPreview
+          open={!!previewing}
+          onOpenChange={(o) => !o && setPreviewing(null)}
+          outputId={previewing.id}
+          filename={previewing.filename}
+          title={previewing.title}
+          config={previewing.style ?? DEFAULT_STYLE_CONFIG}
+          loadChapters={history.loadChapters}
+          initialDark={isDark}
+        />
+      )}
+
       {styling && (
         <StyleEditor
           open={!!styling}
@@ -1215,6 +1273,7 @@ export default function App() {
           canRestyle={!!styling.hasChapters}
           profiles={styleProfiles.profiles}
           busy={restyleBusy}
+          sampleBlocks={styleSample}
           onApply={(config) => void applyStyle(styling, config)}
           onSaveProfile={(name, config) => void styleProfiles.save(name, config)}
           onDeleteProfile={(id) => void styleProfiles.remove(id)}
