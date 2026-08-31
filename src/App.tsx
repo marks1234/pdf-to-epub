@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useMemo, useState } from "react"
+import { Fragment, useEffect, useMemo, useRef, useState } from "react"
 import { useDropzone } from "react-dropzone"
 import {
   DndContext,
@@ -33,6 +33,7 @@ import {
 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
+import { Progress } from "@/components/ui/progress"
 import { TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
   SortableFileItem,
@@ -44,7 +45,7 @@ import { StyleEditor } from "@/components/style-editor"
 import { ThemeToggle } from "@/components/theme-toggle"
 import { cn } from "@/lib/utils"
 import { mergePdfs, countPages } from "@/lib/merge-pdf"
-import { pdfToEpub, restyleEpub } from "@/lib/pdf-to-epub"
+import type { FileFailure } from "@/lib/pdf-to-epub"
 import { downloadBlob } from "@/lib/download"
 import { formatBytes, formatDate, sanitizeFilename } from "@/lib/format"
 import { moveGroup, rangeIds } from "@/lib/reorder"
@@ -56,6 +57,7 @@ import {
   formatNumberRanges,
   rangeBetween,
 } from "@/lib/sequence"
+import { isAbortError, useConverter } from "@/hooks/use-converter"
 import { useNameMemory } from "@/hooks/use-name-memory"
 import { useOutputs } from "@/hooks/use-outputs"
 import { useStyleProfiles } from "@/hooks/use-style-profiles"
@@ -71,8 +73,27 @@ function fileKey(file: File): string {
   return `${file.name}|${file.size}|${file.lastModified}`
 }
 
+/** What a finished conversion has to warn about — absent when it all went well. */
+interface ConvertSummary {
+  /** Files in the batch, so "N of M failed" can be stated. */
+  total: number
+  failures: FileFailure[]
+  emptyChapters: string[]
+}
+
 /** Largest gap span we annotate inline; bigger gaps are only shown in the banner. */
 const MAX_INLINE_GAP = 26
+
+/** Most names a summary banner spells out before summarising the rest. */
+const MAX_LISTED_NAMES = 5
+
+/** "a, b, c" — or "a, b, c, d, e and 7 more" once the list gets long. */
+function briefList(names: string[]): string {
+  if (names.length <= MAX_LISTED_NAMES) return names.join(", ")
+  return `${names.slice(0, MAX_LISTED_NAMES).join(", ")} and ${
+    names.length - MAX_LISTED_NAMES
+  } more`
+}
 
 /** localStorage key holding the style every new conversion starts from. */
 const DEFAULT_STYLE_KEY = "pdf2epub.default-style"
@@ -106,6 +127,8 @@ export default function App() {
 
   /** Files ignored on the last drop because they were already queued. */
   const [skippedDupes, setSkippedDupes] = useState(0)
+  /** Warnings from the last conversion; cleared when the next one starts. */
+  const [summary, setSummary] = useState<ConvertSummary | null>(null)
   /** Single-pane switcher, only rendered below `lg`. */
   const [mobileTab, setMobileTab] = useState<MobileTab>("queue")
   /** Screen-reader announcements for selection and long-running work. */
@@ -127,6 +150,9 @@ export default function App() {
   const authorMemory = useNameMemory("pdf2epub.authors")
   const history = useOutputs()
   const styleProfiles = useStyleProfiles()
+  // Conversion and re-styling both run in a worker; this owns its lifecycle.
+  const converter = useConverter()
+  const { progress } = converter
 
   const [styling, setStyling] = useState<OutputRecord | null>(null)
   const [restyleBusy, setRestyleBusy] = useState(false)
@@ -139,10 +165,13 @@ export default function App() {
       // Chapter text lives in its own store now; pull it in on demand.
       const chapters = out.chapters ?? (await history.loadChapters(out.id))
       if (!chapters) return
-      const blob = await restyleEpub(
+      // The record's id doubles as the book's stable `dc:identifier`, so a
+      // re-styled book replaces the old one on a device instead of joining it.
+      const blob = await converter.restyle(
         chapters,
         { title: out.title, author: out.author || "Unknown" },
         config,
+        out.id,
       )
       await history.add({ ...out, blob, size: blob.size, style: config })
       setStyling(null)
@@ -167,6 +196,19 @@ export default function App() {
     if (items.length === 0) return
     setAnnouncement(`${selected.size} of ${items.length} selected`)
   }, [selected, items.length])
+
+  /** Last ten-file milestone announced, so each one is spoken only once. */
+  const milestone = useRef(0)
+
+  // Announce progress every ten files. Speaking every file would flood the
+  // live region on a 90-file batch and drown out everything else.
+  useEffect(() => {
+    if (!progress || progress.phase !== "extract") return
+    const step = Math.floor(progress.done / 10)
+    if (step === 0 || step === milestone.current) return
+    milestone.current = step
+    setAnnouncement(`Converted ${progress.done} of ${progress.total} files`)
+  }, [progress])
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
@@ -286,6 +328,7 @@ export default function App() {
     setAnchor(null)
     setError(null)
     setSkippedDupes(0)
+    setSummary(null)
   }
 
   const rememberNames = () => {
@@ -328,12 +371,19 @@ export default function App() {
 
   const handleConvert = async () => {
     setError(null)
+    setSummary(null)
     setBusy("converting")
-    setAnnouncement("Converting…")
+    milestone.current = 0
+
+    const files = items.map((i) => i.file)
+    setAnnouncement(
+      `Converting ${files.length} file${files.length === 1 ? "" : "s"}…`,
+    )
+
     try {
-      const files = items.map((i) => i.file)
-      const pages = await countPages(files)
-      const { blob, chapters } = await pdfToEpub(
+      // Extraction already counts every page it opens, so the separate
+      // countPages() parse of the whole batch is pure duplicated work.
+      const result = await converter.convert(
         files,
         {
           title: title || "Merged Document",
@@ -345,21 +395,35 @@ export default function App() {
         id: crypto.randomUUID(),
         kind: "epub",
         filename: `${sanitizeFilename(title || "merged")}.epub`,
-        blob,
+        blob: result.blob,
         title: title || "Merged Document",
         author,
         sources: files.map((f) => f.name),
-        pageCount: pages,
-        size: blob.size,
+        pageCount: result.pageCount,
+        size: result.blob.size,
         createdAt: Date.now(),
-        chapters,
+        chapters: result.chapters,
         style: defaultStyle,
       })
       rememberNames()
-      setAnnouncement("Conversion complete")
+      if (result.failures.length > 0 || result.emptyChapters.length > 0) {
+        setSummary({
+          total: files.length,
+          failures: result.failures,
+          emptyChapters: result.emptyChapters,
+        })
+      }
+      setAnnouncement(
+        `Converted ${result.chapters.length} chapters, ${result.failures.length} failures`,
+      )
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to convert to EPUB.")
-      setAnnouncement("Conversion failed")
+      // Cancelling is a choice, not a failure: reset without an error banner.
+      if (isAbortError(e)) {
+        setAnnouncement("Conversion cancelled")
+      } else {
+        setError(e instanceof Error ? e.message : "Failed to convert to EPUB.")
+        setAnnouncement("Conversion failed")
+      }
     } finally {
       setBusy("idle")
     }
@@ -572,6 +636,43 @@ export default function App() {
               </div>
             )}
 
+            {/* What the last conversion could not do */}
+            {summary && (
+              <div className="flex shrink-0 items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300">
+                <TriangleAlert className="mt-0.5 size-4 shrink-0" />
+                <div className="min-w-0 flex-1 space-y-0.5">
+                  {summary.failures.length > 0 && (
+                    <p>
+                      {summary.failures.length} of {summary.total} files failed:{" "}
+                      <span className="font-semibold">
+                        {briefList(summary.failures.map((f) => f.name))}
+                      </span>
+                      .
+                    </p>
+                  )}
+                  {summary.emptyChapters.length > 0 && (
+                    <p>
+                      {summary.emptyChapters.length} chapter
+                      {summary.emptyChapters.length === 1 ? "" : "s"} had no
+                      extractable text (scanned images?):{" "}
+                      <span className="font-semibold">
+                        {briefList(summary.emptyChapters)}
+                      </span>
+                      .
+                    </p>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSummary(null)}
+                  aria-label="Dismiss conversion summary"
+                  className="-mr-1 shrink-0 rounded-sm p-0.5 opacity-70 transition-opacity hover:opacity-100 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+                >
+                  <X className="size-4" />
+                </button>
+              </div>
+            )}
+
             {/* Sequence / gap detection */}
             {seq.hasOrder &&
               (seq.missing.length > 0 || seq.duplicates.length > 0 ? (
@@ -695,6 +796,47 @@ export default function App() {
 
           {/* Pinned action bar */}
           <div className="shrink-0 border-t bg-background p-3">
+            {/*
+              Live conversion state. Rendered for the whole run, not just once
+              the first progress message lands, so the panel never flickers in.
+            */}
+            {busy === "converting" && (
+              <div className="mb-3 space-y-2 rounded-lg border bg-muted/40 p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <p className="min-w-0 text-sm font-medium">
+                    {progress?.phase === "build"
+                      ? "Building EPUB…"
+                      : `Converting chapter ${Math.min(
+                          (progress?.done ?? 0) + 1,
+                          progress?.total ?? items.length,
+                        )} of ${progress?.total ?? items.length}`}
+                  </p>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="shrink-0"
+                    onClick={converter.cancel}
+                  >
+                    <X className="size-4" />
+                    Cancel
+                  </Button>
+                </div>
+                <Progress
+                  value={
+                    progress && progress.total > 0
+                      ? (progress.done / progress.total) * 100
+                      : 0
+                  }
+                  aria-label="Conversion progress"
+                />
+                {progress?.currentName && (
+                  <p className="truncate text-xs text-muted-foreground">
+                    {progress.currentName}
+                  </p>
+                )}
+              </div>
+            )}
+
             {error && (
               <p className="mb-2 text-sm font-medium text-destructive" role="alert">
                 {error}
@@ -713,12 +855,9 @@ export default function App() {
                 )}
                 Merge PDF
               </Button>
+              {/* No spinner here: the progress panel above carries the state. */}
               <Button onClick={handleConvert} disabled={!hasFiles || isBusy}>
-                {busy === "converting" ? (
-                  <Loader2 className="size-4 animate-spin" />
-                ) : (
-                  <BookOpen className="size-4" />
-                )}
+                <BookOpen className="size-4" />
                 Convert to EPUB
               </Button>
             </div>
