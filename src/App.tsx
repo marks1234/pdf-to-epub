@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useMemo, useState } from "react"
+import { Fragment, useEffect, useMemo, useState } from "react"
 import { useDropzone } from "react-dropzone"
 import {
   DndContext,
@@ -29,20 +29,24 @@ import {
   TriangleAlert,
   Trash2,
   UploadCloud,
+  X,
 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
+import { TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
   SortableFileItem,
   type PdfItem,
+  type SelectModifiers,
 } from "@/components/sortable-file-item"
 import { MemoField } from "@/components/memo-field"
 import { StyleEditor } from "@/components/style-editor"
+import { ThemeToggle } from "@/components/theme-toggle"
 import { cn } from "@/lib/utils"
 import { mergePdfs, countPages } from "@/lib/merge-pdf"
 import { pdfToEpub, restyleEpub } from "@/lib/pdf-to-epub"
 import { downloadBlob } from "@/lib/download"
-import { formatBytes, formatDate } from "@/lib/format"
+import { formatBytes, formatDate, sanitizeFilename } from "@/lib/format"
 import { moveGroup, rangeIds } from "@/lib/reorder"
 import { DEFAULT_STYLE_CONFIG, type StyleConfig } from "@/lib/styles"
 import { HISTORY_CAP, type OutputRecord } from "@/lib/storage"
@@ -55,8 +59,17 @@ import {
 import { useNameMemory } from "@/hooks/use-name-memory"
 import { useOutputs } from "@/hooks/use-outputs"
 import { useStyleProfiles } from "@/hooks/use-style-profiles"
+import { useTheme } from "@/hooks/use-theme"
 
 type Busy = "idle" | "merging" | "converting"
+
+/** Which pane the tab bar shows below the `lg` breakpoint. */
+type MobileTab = "queue" | "output"
+
+/** Identity of a queued file, used to skip re-adding the same PDF. */
+function fileKey(file: File): string {
+  return `${file.name}|${file.size}|${file.lastModified}`
+}
 
 /** Largest gap span we annotate inline; bigger gaps are only shown in the banner. */
 const MAX_INLINE_GAP = 26
@@ -91,6 +104,15 @@ export default function App() {
   const [busy, setBusy] = useState<Busy>("idle")
   const [error, setError] = useState<string | null>(null)
 
+  /** Files ignored on the last drop because they were already queued. */
+  const [skippedDupes, setSkippedDupes] = useState(0)
+  /** Single-pane switcher, only rendered below `lg`. */
+  const [mobileTab, setMobileTab] = useState<MobileTab>("queue")
+  /** Screen-reader announcements for selection and long-running work. */
+  const [announcement, setAnnouncement] = useState("")
+
+  const { theme, cycleTheme } = useTheme()
+
   /** Multi-select in the queue: ids, the last plainly-clicked row, the live drag. */
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set())
   const [anchor, setAnchor] = useState<number | null>(null)
@@ -111,7 +133,9 @@ export default function App() {
 
   const applyStyle = async (out: OutputRecord, config: StyleConfig) => {
     if (!out.chapters) return
+    setError(null)
     setRestyleBusy(true)
+    setAnnouncement("Applying styles…")
     try {
       const blob = await restyleEpub(
         out.chapters,
@@ -120,8 +144,12 @@ export default function App() {
       )
       await history.add({ ...out, blob, size: blob.size, style: config })
       setStyling(null)
+      setAnnouncement("Styles applied")
     } catch (e) {
+      // The dialog stays open so the user keeps their edits; the error is
+      // surfaced as a toast above it (the left-pane banner is covered).
       setError(e instanceof Error ? e.message : "Failed to apply styles.")
+      setAnnouncement("Applying styles failed")
     } finally {
       setRestyleBusy(false)
     }
@@ -132,18 +160,37 @@ export default function App() {
     [items],
   )
 
+  // Keep the live region in step with the selection.
+  useEffect(() => {
+    if (items.length === 0) return
+    setAnnouncement(`${selected.size} of ${items.length} selected`)
+  }, [selected, items.length])
+
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
   )
 
-  const onDrop = useCallback((accepted: File[]) => {
+  /** Queue dropped PDFs, skipping any file already in the queue. */
+  const onDrop = (accepted: File[]) => {
     setError(null)
-    setItems((prev) => [
-      ...prev,
-      ...accepted.map((file) => ({ id: crypto.randomUUID(), file })),
-    ])
-  }, [])
+    const seen = new Set(items.map((i) => fileKey(i.file)))
+    const fresh: PdfItem[] = []
+    let skipped = 0
+
+    for (const file of accepted) {
+      const key = fileKey(file)
+      if (seen.has(key)) {
+        skipped += 1
+        continue
+      }
+      seen.add(key)
+      fresh.push({ id: crypto.randomUUID(), file })
+    }
+
+    setSkippedDupes(skipped)
+    if (fresh.length > 0) setItems((prev) => [...prev, ...fresh])
+  }
 
   const { getRootProps, getInputProps, isDragActive, open } = useDropzone({
     onDrop,
@@ -152,8 +199,11 @@ export default function App() {
     noKeyboard: true,
   })
 
-  /** Click-to-select with shift ranges and ctrl/meta toggles, file-manager style. */
-  const handleSelect = (index: number, id: string, e: React.MouseEvent) => {
+  /**
+   * Select with shift ranges and ctrl/meta toggles, file-manager style. Driven
+   * by both clicks and Space/Enter on a focused row.
+   */
+  const handleSelect = (index: number, id: string, e: SelectModifiers) => {
     const additive = e.ctrlKey || e.metaKey
     if (e.shiftKey && anchor !== null) {
       const range = rangeIds(items, anchor, index)
@@ -233,6 +283,7 @@ export default function App() {
     setSelected(new Set())
     setAnchor(null)
     setError(null)
+    setSkippedDupes(0)
   }
 
   const rememberNames = () => {
@@ -243,6 +294,7 @@ export default function App() {
   const handleMerge = async () => {
     setError(null)
     setBusy("merging")
+    setAnnouncement("Merging PDFs…")
     try {
       const files = items.map((i) => i.file)
       const [bytes, pages] = await Promise.all([
@@ -253,7 +305,7 @@ export default function App() {
       await history.add({
         id: crypto.randomUUID(),
         kind: "pdf",
-        filename: `${title || "merged"}.pdf`,
+        filename: `${sanitizeFilename(title || "merged")}.pdf`,
         blob,
         title: title || "Merged Document",
         author,
@@ -263,8 +315,10 @@ export default function App() {
         createdAt: Date.now(),
       })
       rememberNames()
+      setAnnouncement("Merge complete")
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to merge PDFs.")
+      setAnnouncement("Merge failed")
     } finally {
       setBusy("idle")
     }
@@ -273,6 +327,7 @@ export default function App() {
   const handleConvert = async () => {
     setError(null)
     setBusy("converting")
+    setAnnouncement("Converting…")
     try {
       const files = items.map((i) => i.file)
       const pages = await countPages(files)
@@ -287,7 +342,7 @@ export default function App() {
       await history.add({
         id: crypto.randomUUID(),
         kind: "epub",
-        filename: `${title || "merged"}.epub`,
+        filename: `${sanitizeFilename(title || "merged")}.epub`,
         blob,
         title: title || "Merged Document",
         author,
@@ -299,8 +354,10 @@ export default function App() {
         style: defaultStyle,
       })
       rememberNames()
+      setAnnouncement("Conversion complete")
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to convert to EPUB.")
+      setAnnouncement("Conversion failed")
     } finally {
       setBusy("idle")
     }
@@ -316,7 +373,8 @@ export default function App() {
     setEditingDefault(false)
   }
 
-  const isBusy = busy !== "idle"
+  // A restyle counts as busy: it writes to history, so Merge/Convert must wait.
+  const isBusy = busy !== "idle" || restyleBusy
   const hasFiles = items.length > 0
   /** True while a multi-row selection is being dragged as one block. */
   const groupDrag =
@@ -337,21 +395,68 @@ export default function App() {
               your browser. No uploads.
             </p>
           </div>
-          <Button
-            variant="outline"
-            size="sm"
-            className="shrink-0"
-            onClick={() => setEditingDefault(true)}
-          >
-            <Palette className="size-4" />
-            Colors
-          </Button>
+          <div className="flex shrink-0 items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setEditingDefault(true)}
+            >
+              <Palette className="size-4" />
+              Colors
+            </Button>
+            <ThemeToggle theme={theme} onCycle={cycleTheme} />
+          </div>
         </div>
       </header>
 
+      {/* Screen-reader status: selection size and long-running work. */}
+      <div className="sr-only" role="status" aria-live="polite">
+        {announcement}
+      </div>
+
+      {/* Pane switcher — below lg only, where the split would halve both panes. */}
+      <div className="shrink-0 border-b p-2 lg:hidden">
+        <TabsList>
+          <TabsTrigger
+            active={mobileTab === "queue"}
+            aria-controls="pane-queue"
+            onClick={() => setMobileTab("queue")}
+          >
+            <FileText className="size-4" />
+            Queue
+            {items.length > 0 && (
+              <span className="text-xs tabular-nums opacity-70">
+                {items.length}
+              </span>
+            )}
+          </TabsTrigger>
+          <TabsTrigger
+            active={mobileTab === "output"}
+            aria-controls="pane-output"
+            onClick={() => setMobileTab("output")}
+          >
+            <HardDriveDownload className="size-4" />
+            Output
+            {history.outputs.length > 0 && (
+              <span className="text-xs tabular-nums opacity-70">
+                {history.outputs.length}
+              </span>
+            )}
+          </TabsTrigger>
+        </TabsList>
+      </div>
+
       <main className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-2">
         {/* LEFT — input & queue */}
-        <section className="flex min-h-0 flex-col overflow-hidden lg:border-r">
+        <section
+          id="pane-queue"
+          role="tabpanel"
+          aria-label="Queue"
+          className={cn(
+            "min-h-0 flex-col overflow-hidden lg:flex lg:border-r",
+            mobileTab === "queue" ? "flex" : "hidden",
+          )}
+        >
           <div className="flex min-h-0 flex-1 flex-col gap-3 p-4">
             {/* Dropzone */}
             <div
@@ -446,6 +551,25 @@ export default function App() {
               </div>
             )}
 
+            {/* Duplicates skipped on the last drop */}
+            {skippedDupes > 0 && (
+              <div className="flex shrink-0 items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300">
+                <TriangleAlert className="mt-0.5 size-4 shrink-0" />
+                <p className="flex-1">
+                  Skipped {skippedDupes} duplicate file
+                  {skippedDupes === 1 ? "" : "s"} — already in the queue.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => setSkippedDupes(0)}
+                  aria-label="Dismiss duplicate notice"
+                  className="-mr-1 shrink-0 rounded-sm p-0.5 opacity-70 transition-opacity hover:opacity-100 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+                >
+                  <X className="size-4" />
+                </button>
+              </div>
+            )}
+
             {/* Sequence / gap detection */}
             {seq.hasOrder &&
               (seq.missing.length > 0 || seq.duplicates.length > 0 ? (
@@ -500,7 +624,12 @@ export default function App() {
                     items={items.map((i) => i.id)}
                     strategy={verticalListSortingStrategy}
                   >
-                    <ul className="divide-y select-none">
+                    <ul
+                      className="divide-y select-none"
+                      role="listbox"
+                      aria-multiselectable="true"
+                      aria-label="Queued PDF files"
+                    >
                       {items.map((item, index) => {
                         const cur = seq.numbers[index]
                         const next = seq.numbers[index + 1]
@@ -536,7 +665,10 @@ export default function App() {
                               disabled={isBusy}
                             />
                             {gap && (
-                              <li className="flex items-center justify-center gap-1.5 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-700 dark:bg-amber-950/40 dark:text-amber-400">
+                              <li
+                                role="presentation"
+                                className="flex items-center justify-center gap-1.5 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-700 dark:bg-amber-950/40 dark:text-amber-400"
+                              >
                                 <TriangleAlert className="size-3.5" />
                                 Missing {(seq.label ?? "number").toLowerCase()}
                                 {gap.length > 1 ? "s" : ""}{" "}
@@ -592,7 +724,15 @@ export default function App() {
         </section>
 
         {/* RIGHT — output history */}
-        <section className="flex min-h-0 flex-col overflow-hidden border-t lg:border-t-0">
+        <section
+          id="pane-output"
+          role="tabpanel"
+          aria-label="Output"
+          className={cn(
+            "min-h-0 flex-col overflow-hidden lg:flex",
+            mobileTab === "output" ? "flex" : "hidden",
+          )}
+        >
           <div className="flex shrink-0 items-center justify-between gap-2 border-b px-4 py-3">
             <div>
               <h2 className="flex items-center gap-2 font-semibold">
@@ -716,6 +856,29 @@ export default function App() {
           onSaveProfile={(name, config) => void styleProfiles.save(name, config)}
           onDeleteProfile={(id) => void styleProfiles.remove(id)}
         />
+      )}
+
+      {/*
+        The dialog covers the left pane's error slot, so a failed restyle also
+        gets a toast above it. (A banner inside the dialog would mean editing
+        style-editor.tsx, which this change deliberately leaves alone.)
+      */}
+      {styling && error && (
+        <div
+          role="alert"
+          className="fixed inset-x-0 bottom-4 z-[60] mx-auto flex w-[min(90vw,32rem)] items-start gap-2 rounded-lg border border-destructive/40 bg-background px-3 py-2 text-sm font-medium text-destructive shadow-lg"
+        >
+          <TriangleAlert className="mt-0.5 size-4 shrink-0" />
+          <p className="flex-1">{error}</p>
+          <button
+            type="button"
+            onClick={() => setError(null)}
+            aria-label="Dismiss error"
+            className="-mr-1 shrink-0 rounded-sm p-0.5 opacity-70 transition-opacity hover:opacity-100 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+          >
+            <X className="size-4" />
+          </button>
+        </div>
       )}
 
       {editingDefault && (
