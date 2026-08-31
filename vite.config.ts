@@ -10,8 +10,12 @@ const BASE = "/pdf-to-epub/"
 // https://vite.dev/config/
 export default defineConfig(({ command }) => {
   const base = command === "build" ? BASE : "/"
+  // Honor an externally assigned port (e.g. from the Claude Code preview harness).
+  const port = process.env.PORT ? Number(process.env.PORT) : undefined
   return {
     base,
+    server: { port },
+    preview: { port },
     plugins: [
       react(),
       tailwindcss(),
