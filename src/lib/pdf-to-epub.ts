@@ -3,8 +3,8 @@ import type { TextItem } from "pdfjs-dist/types/src/display/api"
 // Vite resolves this to a hashed URL for the pdf.js worker bundle.
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url"
 import jEpub from "jepub"
-import JSZip from "jszip"
 
+import { normalizeOcf } from "@/lib/epub-normalize"
 import { extractNumber } from "@/lib/sequence"
 import {
   DEFAULT_STYLER,
@@ -25,6 +25,40 @@ export interface EpubMetadata {
   author: string
   publisher?: string
   description?: string
+  /**
+   * BCP-47 language tag, default `"en"`. Drives `dc:language`, which is what
+   * Kindle uses to pick its font stack.
+   */
+  language?: string
+  /** Series name — written as calibre + EPUB 3 collection metadata. */
+  series?: string
+  /** 1-based position within `series`. */
+  seriesIndex?: number
+  /**
+   * Cover image. A book without an embedded cover shows up on Kindle as "Docs"
+   * with a raw filename. Aim for a JPEG, sRGB, no alpha, ≥1200px on the long edge.
+   */
+  cover?: Blob
+  /**
+   * Stable `dc:identifier`. Pass the same value on every re-style so devices
+   * treat the result as a new version of one book rather than a new book.
+   */
+  identifier?: string
+}
+
+/**
+ * The UI languages jepub ships. `init()` throws on anything else, so an
+ * unsupported tag falls back to English for jepub's own strings — `dc:language`
+ * still carries the requested tag (set during normalization).
+ */
+const JEPUB_UI_LANGUAGES = new Set([
+  "en", "vi", "hi", "fr", "de", "es", "it", "pt", "ru", "ja", "ko",
+  "zh", "ar", "nl", "sv", "da", "no", "fi", "pl", "cs", "tr",
+])
+
+function jepubUiLanguage(language: string): string {
+  const base = language.split("-")[0].toLowerCase()
+  return JEPUB_UI_LANGUAGES.has(base) ? base : "en"
 }
 
 /** One chapter's reconstructed content; stored so an EPUB can be re-styled later. */
@@ -49,75 +83,6 @@ function chapterTitle(filename: string): string {
     .replace(/\s+/g, " ")
     .trim()
   return cleaned || base
-}
-
-/**
- * Renumber every NCX `playOrder` sequentially (1, 2, 3, …). jepub can emit
- * duplicate values, which EPUB 2 forbids unless they point to the same target
- * (epubcheck RSC-005). Sequential unique values are always valid.
- */
-function fixNcxPlayOrder(xml: string): string {
-  let n = 0
-  return xml.replace(/playOrder="\d+"/g, () => `playOrder="${++n}"`)
-}
-
-// Where the stylesheet lives in the EPUB. Pages sit in OEBPS/ and link it by
-// relative name; the OPF (book.opf, at the zip root) references it with the
-// OEBPS/ prefix. jepub ships no stylesheet, so we add and wire up our own.
-const STYLESHEET_PATH = "OEBPS/style.css"
-const STYLESHEET_HREF = "style.css"
-const STYLESHEET_MANIFEST_ITEM = `<item id="rarity-css" href="${STYLESHEET_PATH}" media-type="text/css" />`
-const STYLESHEET_LINK = `<link rel="stylesheet" type="text/css" href="${STYLESHEET_HREF}" />`
-
-/** Register the stylesheet in the OPF manifest (epubcheck requires every file declared). */
-function addCssToManifest(opf: string): string {
-  return opf.replace("</manifest>", `\t\t${STYLESHEET_MANIFEST_ITEM}\n\t</manifest>`)
-}
-
-/** Link the stylesheet from a page's `<head>` so its rules apply. */
-function linkCss(html: string): string {
-  return html.replace("</head>", `\t${STYLESHEET_LINK}\n</head>`)
-}
-
-/**
- * Rebuild an EPUB zip so the `mimetype` entry is first and STORED (uncompressed),
- * as required by the OCF spec, and fix the NCX play order. jepub/JSZip otherwise
- * trip epubcheck (PKG-007 / RSC-005) and stricter readers like Send-to-Kindle.
- *
- * Also injects the stylesheet `css`: writes OEBPS/style.css, declares it in the
- * OPF manifest, and links it from every XHTML page.
- */
-async function normalizeOcf(epubBlob: Blob, css: string): Promise<Blob> {
-  const src = await JSZip.loadAsync(epubBlob)
-  const out = new JSZip()
-
-  // mimetype must be the very first entry and uncompressed.
-  out.file("mimetype", "application/epub+zip", { compression: "STORE" })
-
-  for (const entry of Object.values(src.files)) {
-    if (entry.dir || entry.name === "mimetype") continue
-    const name = entry.name.toLowerCase()
-    if (name.endsWith(".ncx")) {
-      const xml = await entry.async("string")
-      out.file(entry.name, fixNcxPlayOrder(xml), { compression: "DEFLATE" })
-    } else if (name.endsWith(".opf")) {
-      const opf = await entry.async("string")
-      out.file(entry.name, addCssToManifest(opf), { compression: "DEFLATE" })
-    } else if (name.endsWith(".html") || name.endsWith(".xhtml")) {
-      const html = await entry.async("string")
-      out.file(entry.name, linkCss(html), { compression: "DEFLATE" })
-    } else {
-      const data = await entry.async("uint8array")
-      out.file(entry.name, data, { compression: "DEFLATE" })
-    }
-  }
-
-  out.file(STYLESHEET_PATH, css, { compression: "DEFLATE" })
-
-  return out.generateAsync({
-    type: "blob",
-    mimeType: "application/epub+zip",
-  })
 }
 
 /** Reconstruct one PDF file into a titled chapter of blocks. */
@@ -153,14 +118,35 @@ export async function chaptersToEpub(
   meta: EpubMetadata,
   styler: Styler = DEFAULT_STYLER,
 ): Promise<Blob> {
+  const language = meta.language || "en"
   const epub = new jEpub()
   epub.init({
-    i18n: "en",
+    i18n: jepubUiLanguage(language),
     title: meta.title,
     author: meta.author,
     publisher: meta.publisher || "pdf-to-epub",
     description: meta.description || "",
   })
+
+  // A stable identifier keeps a re-styled book the *same* book to a device.
+  if (meta.identifier) epub.uuid(meta.identifier)
+  epub.date(new Date())
+
+  if (meta.cover) {
+    // Hand jepub an ArrayBuffer: it then sniffs the format from the magic bytes
+    // instead of trusting `blob.type`, which is empty for some file pickers.
+    const bytes = await meta.cover.arrayBuffer()
+    try {
+      epub.cover(bytes)
+    } catch {
+      // jepub throws bare strings; surface something actionable instead. A
+      // silently dropped cover is exactly what makes Kindle show a book as
+      // "Docs" with a raw filename.
+      throw new Error(
+        "The cover image format isn't supported. Use a JPEG or PNG (JPEG, sRGB, no transparency works best on Kindle).",
+      )
+    }
+  }
 
   for (const ch of chapters) {
     const html =
@@ -174,8 +160,13 @@ export async function chaptersToEpub(
   // doesn't point at a missing file (epubcheck RSC-001).
   epub.notes(`Generated by pdf-to-epub from ${chapters.length} file(s).`)
 
-  const raw = (await epub.generate("blob")) as Blob
-  return normalizeOcf(raw, styler.css)
+  const raw = await epub.generate("blob")
+  return normalizeOcf(raw, {
+    css: styler.css,
+    language,
+    series: meta.series,
+    seriesIndex: meta.seriesIndex,
+  })
 }
 
 /**
@@ -200,11 +191,22 @@ export async function pdfToEpub(
   return { blob, chapters }
 }
 
-/** Re-render stored chapters into a new EPUB Blob using a custom style config. */
+/**
+ * Re-render stored chapters into a new EPUB Blob using a custom style config.
+ *
+ * Pass `identifier` (the output record's id) so every re-style of the same book
+ * keeps one `dc:identifier` — readers then replace the book instead of filing a
+ * duplicate. It overrides `meta.identifier` when both are given.
+ */
 export async function restyleEpub(
   chapters: Chapter[],
   meta: EpubMetadata,
   config: StyleConfig,
+  identifier?: string,
 ): Promise<Blob> {
-  return chaptersToEpub(chapters, meta, createStyler(config))
+  return chaptersToEpub(
+    chapters,
+    identifier ? { ...meta, identifier } : meta,
+    createStyler(config),
+  )
 }
