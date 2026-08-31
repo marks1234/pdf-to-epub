@@ -9,8 +9,10 @@ import { VitePWA } from "vite-plugin-pwa"
 const BASE = "/pdf-to-epub/"
 
 // https://vite.dev/config/
-export default defineConfig(({ command }) => {
-  const base = command === "build" ? BASE : "/"
+export default defineConfig(({ command, isPreview }) => {
+  // The built bundle hardcodes BASE into its asset URLs, so `vite preview`
+  // must serve under the same base or every asset 404s.
+  const base = command === "build" || isPreview ? BASE : "/"
   // Honor an externally assigned port (e.g. from the Claude Code preview harness).
   const port = process.env.PORT ? Number(process.env.PORT) : undefined
   return {
