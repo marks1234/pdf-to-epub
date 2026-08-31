@@ -105,6 +105,50 @@ describe("pdfToChapters", () => {
     ])
   })
 
+  it("uses supplied titles, index-aligned, and derives the rest", async () => {
+    const result = await pdfToChapters(
+      [
+        pdf("Chapter 1.pdf", [["One."]]),
+        pdf("Chapter 2.pdf", [["Two."]]),
+        pdf("epilogue_final.pdf", [["Three."]]),
+      ],
+      { titles: [undefined, "The Turning Point", "  Epilogue  "] },
+    )
+    expect(result.chapters.map((c) => c.title)).toEqual([
+      "Chapter 1",
+      "The Turning Point",
+      "Epilogue",
+    ])
+  })
+
+  it("falls back to the derived title for blank entries and a short array", async () => {
+    const result = await pdfToChapters(
+      [pdf("Chapter 1.pdf", [["One."]]), pdf("Chapter 2.pdf", [["Two."]])],
+      { titles: ["   "] },
+    )
+    expect(result.chapters.map((c) => c.title)).toEqual(["Chapter 1", "Chapter 2"])
+  })
+
+  it("reports an empty chapter under its custom title", async () => {
+    const result = await pdfToChapters([pdf("Chapter 1.pdf", [[]])], {
+      titles: ["Missing Pages"],
+    })
+    expect(result.emptyChapters).toEqual(["Missing Pages"])
+  })
+
+  it("keeps titles aligned with files when one in the middle fails", async () => {
+    const result = await pdfToChapters(
+      [
+        pdf("Chapter 1.pdf", [["One."]]),
+        brokenPdf("Chapter 2.pdf", "Invalid PDF structure"),
+        pdf("Chapter 3.pdf", [["Three."]]),
+      ],
+      { titles: ["First", "Second", "Third"] },
+    )
+    // The skipped file takes its title with it; it does not shift onto the next.
+    expect(result.chapters.map((c) => c.title)).toEqual(["First", "Third"])
+  })
+
   it("contains a failing file instead of killing the batch", async () => {
     const result = await pdfToChapters([
       pdf("Chapter 1.pdf", [["Fine."]]),

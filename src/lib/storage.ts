@@ -9,9 +9,13 @@
  * history never has to deserialize every book's full text. Use `getChapters(id)`
  * to pull them in on demand; listed records carry a `hasChapters` flag instead.
  *
+ * A separate `queue` store holds the *input* queue — the PDFs the user has lined
+ * up but not converted yet — so a reload does not lose their work. That one does
+ * hold raw PDF bytes, but only for a single snapshot the user can clear.
+ *
  * The pure helpers at the top (byte accounting, prune selection, the chapter
- * split/migration transform) are exported so they can be unit-tested without an
- * IndexedDB implementation.
+ * split/migration transform, the queue snapshot transforms) are exported so they
+ * can be unit-tested without an IndexedDB implementation.
  */
 
 import type { Chapter } from "@/lib/pdf-to-epub"
@@ -21,7 +25,11 @@ const DB_NAME = "pdf-to-epub"
 const STORE = "outputs"
 const PROFILE_STORE = "styleProfiles"
 const CHAPTER_STORE = "chapters"
-const VERSION = 3
+const QUEUE_STORE = "queue"
+const VERSION = 4
+
+/** The queue store holds exactly one snapshot, under this fixed key. */
+const QUEUE_KEY = "current"
 
 /** Maximum number of outputs to retain; oldest beyond this are pruned. */
 export const HISTORY_CAP = 50
@@ -59,6 +67,33 @@ export interface OutputRecord {
   chaptersSize?: number
   /** The style config last applied to this EPUB (defaults to the built-in look). */
   style?: StyleConfig
+  /**
+   * Book metadata the EPUB was built with, so a re-style can reproduce it.
+   * Older records predate this field; a re-style then falls back to title/author.
+   */
+  meta?: StoredBookMeta
+}
+
+/**
+ * The book-level metadata an EPUB build consumes beyond title and author.
+ *
+ * Kept as a snapshot on the output record because a re-style rebuilds the whole
+ * EPUB from stored chapters: without it, language, series, description and the
+ * cover would silently vanish the first time the user touched the Style editor.
+ */
+export interface StoredBookMeta {
+  /** BCP-47 tag driving `dc:language`. */
+  language?: string
+  description?: string
+  series?: string
+  seriesIndex?: number
+  cover?: Blob
+  /**
+   * The `dc:title` actually written, which may be the Kindle series-sort form
+   * ("Quest Academy 03 — Rise of the Guild") rather than the plain title shown
+   * in the history list.
+   */
+  epubTitle?: string
 }
 
 /** A saved, reusable style configuration. */
@@ -181,6 +216,82 @@ export function splitChapters(rec: OutputRecord): SplitRecord {
   }
 }
 
+// ── Queue snapshot (pure shape + transforms) ─────────────────────────────────
+
+/**
+ * One queued PDF as it is stored. `File` is structured-cloneable, but its
+ * identity fields are not worth trusting across a round trip in every browser,
+ * so name and lastModified are recorded explicitly and the file is rebuilt from
+ * them on the way out.
+ */
+export interface QueuedFile {
+  id: string
+  name: string
+  lastModified: number
+  blob: Blob
+  /** User-set chapter title; absent means "derive it from the name". */
+  customTitle?: string
+}
+
+/** The Book-details fields that ride along with a saved queue. */
+export interface QueueDetails {
+  title?: string
+  author?: string
+  language?: string
+  description?: string
+  series?: string
+  seriesIndex?: number
+  cover?: Blob
+  /** Whether the Kindle series-sort title was switched on. */
+  kindleSeriesTitle?: boolean
+}
+
+/** Everything one saved queue holds. */
+export interface QueueSnapshot {
+  files: QueuedFile[]
+  details: QueueDetails
+  savedAt: number
+}
+
+/** The shape `toQueuedFiles` accepts — a `PdfItem` satisfies it structurally. */
+export interface QueueItemLike {
+  id: string
+  file: File
+  customTitle?: string
+}
+
+/** Reduce live queue items to the record shape the queue store holds. */
+export function toQueuedFiles(items: QueueItemLike[]): QueuedFile[] {
+  return items.map((item) => ({
+    id: item.id,
+    name: item.file.name,
+    lastModified: item.file.lastModified,
+    blob: item.file,
+    ...(item.customTitle?.trim() ? { customTitle: item.customTitle.trim() } : {}),
+  }))
+}
+
+/**
+ * Rebuild live queue items from a stored snapshot, reconstructing each `File`
+ * so name, size and lastModified match the original — which is what the
+ * duplicate check in the dropzone keys on.
+ *
+ * Entries missing a blob (a partially written snapshot) are dropped rather than
+ * restored as empty files.
+ */
+export function fromQueuedFiles(files: QueuedFile[]): QueueItemLike[] {
+  return files
+    .filter((f) => f.blob instanceof Blob)
+    .map((f) => ({
+      id: f.id || crypto.randomUUID(),
+      file: new File([f.blob], f.name, {
+        type: "application/pdf",
+        lastModified: f.lastModified,
+      }),
+      ...(f.customTitle ? { customTitle: f.customTitle } : {}),
+    }))
+}
+
 function isQuotaExceeded(e: unknown): boolean {
   return (
     e instanceof DOMException &&
@@ -212,6 +323,11 @@ function openDB(): Promise<IDBDatabase> {
         db.createObjectStore(CHAPTER_STORE)
         // v2 → v3: lift chapters embedded in existing records into the new store.
         if (upgradeTx) migrateEmbeddedChapters(upgradeTx)
+      }
+      // v3 → v4: purely additive. A single out-of-line snapshot of the input
+      // queue; existing records need no rewriting.
+      if (!db.objectStoreNames.contains(QUEUE_STORE)) {
+        db.createObjectStore(QUEUE_STORE)
       }
     }
     req.onsuccess = () => resolve(req.result)
@@ -457,6 +573,58 @@ export async function getStorageEstimate(): Promise<StorageEstimate | null> {
   if (!navigator.storage?.estimate) return null
   const { usage = 0, quota = 0 } = await navigator.storage.estimate()
   return { usage, quota, budget: computeByteBudget(quota) }
+}
+
+// ── Input queue ──────────────────────────────────────────────────────────────
+
+/**
+ * Save the current input queue, replacing any previous snapshot.
+ *
+ * Called from a debounced effect, so it is deliberately cheap and total: one
+ * `put` of one record. Saving an empty queue is meaningful — it is how clearing
+ * the queue is persisted.
+ */
+export async function saveQueue(
+  files: QueuedFile[],
+  details: QueueDetails = {},
+): Promise<void> {
+  const snapshot: QueueSnapshot = { files, details, savedAt: Date.now() }
+  const db = await openDB()
+  try {
+    const store = tx(db, "readwrite", QUEUE_STORE)
+    store.put(snapshot, QUEUE_KEY)
+    await done(store.transaction)
+  } catch (e) {
+    if (isQuotaExceeded(e)) throw new Error(QUOTA_MESSAGE)
+    throw e
+  } finally {
+    db.close()
+  }
+}
+
+/** The saved queue, or null when nothing has been saved. */
+export async function loadQueue(): Promise<QueueSnapshot | null> {
+  const db = await openDB()
+  try {
+    const result = (await req(tx(db, "readonly", QUEUE_STORE).get(QUEUE_KEY))) as
+      | QueueSnapshot
+      | undefined
+    if (!result || !Array.isArray(result.files)) return null
+    return { ...result, details: result.details ?? {} }
+  } finally {
+    db.close()
+  }
+}
+
+export async function clearQueue(): Promise<void> {
+  const db = await openDB()
+  try {
+    const store = tx(db, "readwrite", QUEUE_STORE)
+    store.delete(QUEUE_KEY)
+    await done(store.transaction)
+  } finally {
+    db.close()
+  }
 }
 
 // ── Style profiles ───────────────────────────────────────────────────────────

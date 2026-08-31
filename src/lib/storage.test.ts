@@ -7,11 +7,14 @@ import {
   QUOTA_FRACTION,
   computeByteBudget,
   estimateChaptersBytes,
+  fromQueuedFiles,
   recordBytes,
   selectPruneVictims,
   splitChapters,
+  toQueuedFiles,
   type OutputRecord,
   type PruneCandidate,
+  type QueuedFile,
 } from "./storage"
 
 /**
@@ -242,5 +245,72 @@ describe("splitChapters (v2 -> v3 migration transform)", () => {
     const rec = record({ chapters: [chapter("One", ["hello"])] })
     splitChapters(rec)
     expect(rec.chapters).toHaveLength(1)
+  })
+})
+
+describe("queue snapshot transforms", () => {
+  function pdf(name: string, body = "pdf-bytes", lastModified = 1700000000000) {
+    return new File([body], name, { type: "application/pdf", lastModified })
+  }
+
+  it("reduces items to name, lastModified and blob", () => {
+    const [stored] = toQueuedFiles([{ id: "a", file: pdf("ch1.pdf") }])
+    expect(stored.id).toBe("a")
+    expect(stored.name).toBe("ch1.pdf")
+    expect(stored.lastModified).toBe(1700000000000)
+    expect(stored.blob).toBeInstanceOf(Blob)
+  })
+
+  it("keeps a custom title and drops a blank one", () => {
+    const stored = toQueuedFiles([
+      { id: "a", file: pdf("a.pdf"), customTitle: "  Opening  " },
+      { id: "b", file: pdf("b.pdf"), customTitle: "   " },
+      { id: "c", file: pdf("c.pdf") },
+    ])
+    expect(stored[0].customTitle).toBe("Opening")
+    expect("customTitle" in stored[1]).toBe(false)
+    expect("customTitle" in stored[2]).toBe(false)
+  })
+
+  it("preserves order", () => {
+    const stored = toQueuedFiles(
+      ["c.pdf", "a.pdf", "b.pdf"].map((n, i) => ({ id: `${i}`, file: pdf(n) })),
+    )
+    expect(stored.map((s) => s.name)).toEqual(["c.pdf", "a.pdf", "b.pdf"])
+  })
+
+  it("round-trips to real Files with the identity fields intact", async () => {
+    const items = [{ id: "a", file: pdf("ch1.pdf", "hello"), customTitle: "One" }]
+    const [back] = fromQueuedFiles(toQueuedFiles(items))
+    expect(back.id).toBe("a")
+    expect(back.file).toBeInstanceOf(File)
+    expect(back.file.name).toBe("ch1.pdf")
+    expect(back.file.lastModified).toBe(1700000000000)
+    expect(back.file.size).toBe(items[0].file.size)
+    expect(await back.file.text()).toBe("hello")
+    expect(back.customTitle).toBe("One")
+  })
+
+  it("restores files as PDFs so the dropzone's duplicate check still matches", () => {
+    const [back] = fromQueuedFiles(toQueuedFiles([{ id: "a", file: pdf("a.pdf") }]))
+    expect(back.file.type).toBe("application/pdf")
+  })
+
+  it("omits customTitle when none was stored", () => {
+    const [back] = fromQueuedFiles(toQueuedFiles([{ id: "a", file: pdf("a.pdf") }]))
+    expect("customTitle" in back).toBe(false)
+  })
+
+  it("drops entries whose blob did not survive", () => {
+    const broken = [
+      { id: "a", name: "a.pdf", lastModified: 1, blob: undefined },
+      { id: "b", name: "b.pdf", lastModified: 1, blob: new Blob(["x"]) },
+    ] as unknown as QueuedFile[]
+    expect(fromQueuedFiles(broken).map((i) => i.file.name)).toEqual(["b.pdf"])
+  })
+
+  it("handles an empty queue in both directions", () => {
+    expect(toQueuedFiles([])).toEqual([])
+    expect(fromQueuedFiles([])).toEqual([])
   })
 })

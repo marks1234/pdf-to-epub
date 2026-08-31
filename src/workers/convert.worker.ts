@@ -34,6 +34,8 @@ export interface ConvertRequest {
   files: File[]
   meta: EpubMetadata
   config?: StyleConfig
+  /** Chapter titles, index-aligned with `files`; blanks derive from the name. */
+  titles?: (string | undefined)[]
 }
 
 /** Re-render stored chapters with a new style — jepub and JSZip block too. */
@@ -141,6 +143,7 @@ async function runConvert(
   await ensurePdfWorker()
   const result = await pdfToEpub(req.files, req.meta, req.config, {
     signal,
+    titles: req.titles,
     // The last file's report is also the handover to the (unmeasurable) build
     // phase: templating and zipping the whole book happen after it.
     onProgress: (done, total, currentName) =>
