@@ -8,10 +8,10 @@ import {
   useSensor,
   useSensors,
   type DragEndEvent,
+  type DragStartEvent,
 } from "@dnd-kit/core"
 import {
   SortableContext,
-  arrayMove,
   sortableKeyboardCoordinates,
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable"
@@ -43,6 +43,7 @@ import { mergePdfs, countPages } from "@/lib/merge-pdf"
 import { pdfToEpub, restyleEpub } from "@/lib/pdf-to-epub"
 import { downloadBlob } from "@/lib/download"
 import { formatBytes, formatDate } from "@/lib/format"
+import { moveGroup, rangeIds } from "@/lib/reorder"
 import { DEFAULT_STYLE_CONFIG, type StyleConfig } from "@/lib/styles"
 import { HISTORY_CAP, type OutputRecord } from "@/lib/storage"
 import {
@@ -60,6 +61,22 @@ type Busy = "idle" | "merging" | "converting"
 /** Largest gap span we annotate inline; bigger gaps are only shown in the banner. */
 const MAX_INLINE_GAP = 26
 
+/** localStorage key holding the style every new conversion starts from. */
+const DEFAULT_STYLE_KEY = "pdf2epub.default-style"
+
+/** Read the saved default style, falling back to the built-in look. */
+function loadDefaultStyle(): StyleConfig {
+  try {
+    const raw = localStorage.getItem(DEFAULT_STYLE_KEY)
+    if (!raw) return DEFAULT_STYLE_CONFIG
+    const parsed = JSON.parse(raw) as StyleConfig
+    if (!parsed || !Array.isArray(parsed.rarities)) return DEFAULT_STYLE_CONFIG
+    return parsed
+  } catch {
+    return DEFAULT_STYLE_CONFIG
+  }
+}
+
 function byNaturalName(a: PdfItem, b: PdfItem): number {
   return a.file.name.localeCompare(b.file.name, undefined, {
     numeric: true,
@@ -73,6 +90,16 @@ export default function App() {
   const [author, setAuthor] = useState("")
   const [busy, setBusy] = useState<Busy>("idle")
   const [error, setError] = useState<string | null>(null)
+
+  /** Multi-select in the queue: ids, the last plainly-clicked row, the live drag. */
+  const [selected, setSelected] = useState<ReadonlySet<string>>(new Set())
+  const [anchor, setAnchor] = useState<number | null>(null)
+  const [activeId, setActiveId] = useState<string | null>(null)
+
+  const [defaultStyle, setDefaultStyle] = useState<StyleConfig>(() =>
+    loadDefaultStyle(),
+  )
+  const [editingDefault, setEditingDefault] = useState(false)
 
   const titleMemory = useNameMemory("pdf2epub.titles")
   const authorMemory = useNameMemory("pdf2epub.authors")
@@ -125,18 +152,71 @@ export default function App() {
     noKeyboard: true,
   })
 
+  /** Click-to-select with shift ranges and ctrl/meta toggles, file-manager style. */
+  const handleSelect = (index: number, id: string, e: React.MouseEvent) => {
+    const additive = e.ctrlKey || e.metaKey
+    if (e.shiftKey && anchor !== null) {
+      const range = rangeIds(items, anchor, index)
+      setSelected((prev) =>
+        additive ? new Set([...prev, ...range]) : new Set(range),
+      )
+      return
+    }
+
+    setAnchor(index)
+    if (additive) {
+      setSelected((prev) => {
+        const next = new Set(prev)
+        if (next.has(id)) next.delete(id)
+        else next.add(id)
+        return next
+      })
+      return
+    }
+
+    // Plain click: select just this row, or clear if it was already the only one.
+    setSelected((prev) =>
+      prev.size === 1 && prev.has(id) ? new Set() : new Set([id]),
+    )
+  }
+
+  const handleDragStart = (event: DragStartEvent) => {
+    const id = String(event.active.id)
+    // Dragging a row outside the selection drags only that row.
+    if (!selected.has(id)) setSelected(new Set())
+    setActiveId(id)
+  }
+
   const handleDragEnd = (event: DragEndEvent) => {
+    setActiveId(null)
     const { active, over } = event
-    if (!over || active.id === over.id) return
-    setItems((prev) => {
-      const oldIndex = prev.findIndex((i) => i.id === active.id)
-      const newIndex = prev.findIndex((i) => i.id === over.id)
-      return arrayMove(prev, oldIndex, newIndex)
+    if (!over) return
+    setItems(
+      (prev) =>
+        moveGroup(
+          prev,
+          selected,
+          String(active.id),
+          String(over.id),
+        ) as PdfItem[],
+    )
+  }
+
+  const removeItem = (id: string) => {
+    setItems((prev) => prev.filter((i) => i.id !== id))
+    setSelected((prev) => {
+      if (!prev.has(id)) return prev
+      const next = new Set(prev)
+      next.delete(id)
+      return next
     })
   }
 
-  const removeItem = (id: string) =>
-    setItems((prev) => prev.filter((i) => i.id !== id))
+  const removeSelected = () => {
+    setItems((prev) => prev.filter((i) => !selected.has(i.id)))
+    setSelected(new Set())
+    setAnchor(null)
+  }
 
   const autoOrder = () =>
     setItems((prev) =>
@@ -150,6 +230,8 @@ export default function App() {
 
   const clearAll = () => {
     setItems([])
+    setSelected(new Set())
+    setAnchor(null)
     setError(null)
   }
 
@@ -194,10 +276,14 @@ export default function App() {
     try {
       const files = items.map((i) => i.file)
       const pages = await countPages(files)
-      const { blob, chapters } = await pdfToEpub(files, {
-        title: title || "Merged Document",
-        author: author || "Unknown",
-      })
+      const { blob, chapters } = await pdfToEpub(
+        files,
+        {
+          title: title || "Merged Document",
+          author: author || "Unknown",
+        },
+        defaultStyle,
+      )
       await history.add({
         id: crypto.randomUUID(),
         kind: "epub",
@@ -210,6 +296,7 @@ export default function App() {
         size: blob.size,
         createdAt: Date.now(),
         chapters,
+        style: defaultStyle,
       })
       rememberNames()
     } catch (e) {
@@ -219,22 +306,46 @@ export default function App() {
     }
   }
 
+  const saveDefaultStyle = (config: StyleConfig) => {
+    setDefaultStyle(config)
+    try {
+      localStorage.setItem(DEFAULT_STYLE_KEY, JSON.stringify(config))
+    } catch {
+      // Storage full or blocked — the style still applies for this session.
+    }
+    setEditingDefault(false)
+  }
+
   const isBusy = busy !== "idle"
   const hasFiles = items.length > 0
+  /** True while a multi-row selection is being dragged as one block. */
+  const groupDrag =
+    activeId !== null && selected.has(activeId) && selected.size > 1
 
   return (
     <div className="flex h-svh flex-col overflow-hidden bg-background text-foreground">
       {/* Header */}
       <header className="shrink-0 border-b">
-        <div className="px-4 py-3">
-          <h1 className="flex items-center gap-2 text-lg font-semibold tracking-tight">
-            <BookOpen className="size-5" />
-            PDF Merge &amp; EPUB
-          </h1>
-          <p className="text-sm text-muted-foreground">
-            Combine PDFs and convert them to EPUB — everything runs locally in
-            your browser. No uploads.
-          </p>
+        <div className="flex items-start justify-between gap-3 px-4 py-3">
+          <div>
+            <h1 className="flex items-center gap-2 text-lg font-semibold tracking-tight">
+              <BookOpen className="size-5" />
+              PDF Merge &amp; EPUB
+            </h1>
+            <p className="text-sm text-muted-foreground">
+              Combine PDFs and convert them to EPUB — everything runs locally in
+              your browser. No uploads.
+            </p>
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            className="shrink-0"
+            onClick={() => setEditingDefault(true)}
+          >
+            <Palette className="size-4" />
+            Colors
+          </Button>
         </div>
       </header>
 
@@ -286,10 +397,33 @@ export default function App() {
             {hasFiles && (
               <div className="flex shrink-0 items-center justify-between gap-2">
                 <span className="text-sm text-muted-foreground">
-                  {items.length} {items.length === 1 ? "file" : "files"} · drag
-                  to reorder
+                  {selected.size > 0
+                    ? `${selected.size} of ${items.length} selected — drag any selected row to move them together`
+                    : `${items.length} ${
+                        items.length === 1 ? "file" : "files"
+                      } · click to select, drag to reorder`}
                 </span>
-                <div className="flex items-center gap-2">
+                <div className="flex shrink-0 items-center gap-2">
+                  {selected.size > 0 && (
+                    <>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={removeSelected}
+                        disabled={isBusy}
+                      >
+                        <Trash2 className="size-4" />
+                        Remove selected
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => setSelected(new Set())}
+                      >
+                        Deselect
+                      </Button>
+                    </>
+                  )}
                   <Button
                     variant="outline"
                     size="sm"
@@ -358,13 +492,15 @@ export default function App() {
                 <DndContext
                   sensors={sensors}
                   collisionDetection={closestCenter}
+                  onDragStart={handleDragStart}
+                  onDragCancel={() => setActiveId(null)}
                   onDragEnd={handleDragEnd}
                 >
                   <SortableContext
                     items={items.map((i) => i.id)}
                     strategy={verticalListSortingStrategy}
                   >
-                    <ul className="divide-y">
+                    <ul className="divide-y select-none">
                       {items.map((item, index) => {
                         const cur = seq.numbers[index]
                         const next = seq.numbers[index + 1]
@@ -382,6 +518,20 @@ export default function App() {
                             <SortableFileItem
                               item={item}
                               index={index}
+                              selected={selected.has(item.id)}
+                              dimmed={
+                                groupDrag &&
+                                selected.has(item.id) &&
+                                item.id !== activeId
+                              }
+                              dragCount={
+                                groupDrag && item.id === activeId
+                                  ? selected.size
+                                  : undefined
+                              }
+                              onSelect={(e) =>
+                                handleSelect(index, item.id, e)
+                              }
                               onRemove={removeItem}
                               disabled={isBusy}
                             />
@@ -565,6 +715,23 @@ export default function App() {
           onApply={(config) => void applyStyle(styling, config)}
           onSaveProfile={(name, config) => void styleProfiles.save(name, config)}
           onDeleteProfile={(id) => void styleProfiles.remove(id)}
+        />
+      )}
+
+      {editingDefault && (
+        <StyleEditor
+          open={editingDefault}
+          onOpenChange={(o) => !o && setEditingDefault(false)}
+          filename="Default style — used for new conversions"
+          initialConfig={defaultStyle}
+          canRestyle
+          profiles={styleProfiles.profiles}
+          busy={false}
+          onApply={saveDefaultStyle}
+          onSaveProfile={(name, config) => void styleProfiles.save(name, config)}
+          onDeleteProfile={(id) => void styleProfiles.remove(id)}
+          applyLabel="Save default style"
+          hint="Used for new conversions."
         />
       )}
     </div>

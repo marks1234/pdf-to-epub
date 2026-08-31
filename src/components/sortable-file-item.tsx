@@ -1,3 +1,4 @@
+import type { MouseEvent } from "react"
 import { useSortable } from "@dnd-kit/sortable"
 import { CSS } from "@dnd-kit/utilities"
 import { FileText, GripVertical, Trash2 } from "lucide-react"
@@ -19,6 +20,12 @@ function formatSize(bytes: number): string {
 interface SortableFileItemProps {
   item: PdfItem
   index: number
+  selected: boolean
+  /** True for other members of the selection while their group is being dragged. */
+  dimmed: boolean
+  /** Number badge shown on the dragged row when it carries a group. */
+  dragCount?: number
+  onSelect: (e: MouseEvent) => void
   onRemove: (id: string) => void
   disabled?: boolean
 }
@@ -26,6 +33,10 @@ interface SortableFileItemProps {
 export function SortableFileItem({
   item,
   index,
+  selected,
+  dimmed,
+  dragCount,
+  onSelect,
   onRemove,
   disabled,
 }: SortableFileItemProps) {
@@ -47,11 +58,20 @@ export function SortableFileItem({
     <li
       ref={setNodeRef}
       style={style}
+      onClick={onSelect}
+      data-selected={selected || undefined}
       className={cn(
-        "flex items-center gap-2 bg-background p-3",
+        "flex cursor-default items-center gap-2 p-3 transition-opacity",
+        selected ? "bg-accent" : "bg-background",
+        dimmed && "opacity-40",
         isDragging && "relative z-10 rounded-md shadow-lg ring-1 ring-border",
       )}
     >
+      {isDragging && dragCount != null && dragCount > 1 && (
+        <span className="absolute -top-2 -left-2 z-20 flex size-6 items-center justify-center rounded-full bg-primary text-xs font-semibold text-primary-foreground shadow">
+          {dragCount}
+        </span>
+      )}
       <button
         type="button"
         className={cn(
@@ -60,6 +80,7 @@ export function SortableFileItem({
         )}
         aria-label="Drag to reorder"
         disabled={disabled}
+        onClick={(e) => e.stopPropagation()}
         {...attributes}
         {...listeners}
       >
@@ -81,7 +102,10 @@ export function SortableFileItem({
         variant="ghost"
         size="icon"
         className="shrink-0"
-        onClick={() => onRemove(item.id)}
+        onClick={(e) => {
+          e.stopPropagation()
+          onRemove(item.id)
+        }}
         disabled={disabled}
         aria-label={`Remove ${item.file.name}`}
       >

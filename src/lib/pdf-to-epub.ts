@@ -182,13 +182,21 @@ export async function chaptersToEpub(
  * Convert PDF files into a single EPUB — one chapter per file. Returns both the
  * Blob and the reconstructed chapters so the caller can persist the chapters and
  * re-style the EPUB later without re-parsing the PDFs.
+ *
+ * `config` overrides the built-in look, letting the caller convert straight into
+ * their saved default style.
  */
 export async function pdfToEpub(
   files: File[],
   meta: EpubMetadata,
+  config?: StyleConfig,
 ): Promise<{ blob: Blob; chapters: Chapter[] }> {
   const chapters = await pdfToChapters(files)
-  const blob = await chaptersToEpub(chapters, meta)
+  const blob = await chaptersToEpub(
+    chapters,
+    meta,
+    config ? createStyler(config) : DEFAULT_STYLER,
+  )
   return { blob, chapters }
 }
 

@@ -146,6 +146,10 @@ export interface StyleEditorProps {
   onApply: (config: StyleConfig) => void
   onSaveProfile: (name: string, config: StyleConfig) => void
   onDeleteProfile: (id: string) => void
+  /** Label for the confirm button; defaults to the per-EPUB wording. */
+  applyLabel?: string
+  /** Footer hint shown while idle; defaults to the per-EPUB wording. */
+  hint?: string
 }
 
 export function StyleEditor({
@@ -159,6 +163,8 @@ export function StyleEditor({
   onApply,
   onSaveProfile,
   onDeleteProfile,
+  applyLabel = "Apply to EPUB",
+  hint = "Changes apply to this EPUB.",
 }: StyleEditorProps) {
   const [config, setConfig] = useState<StyleConfig>(() =>
     cloneConfig(initialConfig ?? DEFAULT_STYLE_CONFIG),
@@ -446,13 +452,13 @@ export function StyleEditor({
 
         <DialogFooter>
           <span className="mr-auto self-center text-xs text-muted-foreground">
-            {busy ? "Applying…" : "Changes apply to this EPUB."}
+            {busy ? "Applying…" : hint}
           </span>
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={busy}>
             Cancel
           </Button>
           <Button onClick={() => onApply(config)} disabled={busy || !canRestyle}>
-            <Check className="size-4" /> Apply to EPUB
+            <Check className="size-4" /> {applyLabel}
           </Button>
         </DialogFooter>
       </DialogContent>
