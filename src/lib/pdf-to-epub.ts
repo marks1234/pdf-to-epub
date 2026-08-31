@@ -16,10 +16,6 @@ import { createStyler, type StyleConfig, type Styler } from "@/lib/styles"
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl
 
-// The reconstruction/render logic lives in reconstruct.ts; re-exported for tests.
-export type { Block, ReconstructedLine } from "@/lib/reconstruct"
-export { assembleBlocks, blocksToHtml } from "@/lib/reconstruct"
-
 export interface EpubMetadata {
   title: string
   author: string
