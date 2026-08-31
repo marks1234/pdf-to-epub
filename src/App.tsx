@@ -110,11 +110,13 @@ export default function App() {
   const [restyleBusy, setRestyleBusy] = useState(false)
 
   const applyStyle = async (out: OutputRecord, config: StyleConfig) => {
-    if (!out.chapters) return
     setRestyleBusy(true)
     try {
+      // Chapter text lives in its own store now; pull it in on demand.
+      const chapters = out.chapters ?? (await history.loadChapters(out.id))
+      if (!chapters) return
       const blob = await restyleEpub(
-        out.chapters,
+        chapters,
         { title: out.title, author: out.author || "Unknown" },
         config,
       )
@@ -709,7 +711,7 @@ export default function App() {
           onOpenChange={(o) => !o && setStyling(null)}
           filename={styling.filename}
           initialConfig={styling.style ?? DEFAULT_STYLE_CONFIG}
-          canRestyle={!!styling.chapters}
+          canRestyle={!!styling.hasChapters}
           profiles={styleProfiles.profiles}
           busy={restyleBusy}
           onApply={(config) => void applyStyle(styling, config)}
