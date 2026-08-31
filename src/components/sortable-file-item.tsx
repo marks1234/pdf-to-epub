@@ -1,9 +1,10 @@
-import type { MouseEvent } from "react"
+import type { KeyboardEvent } from "react"
 import { useSortable } from "@dnd-kit/sortable"
 import { CSS } from "@dnd-kit/utilities"
 import { FileText, GripVertical, Trash2 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
+import { formatBytes } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
 export interface PdfItem {
@@ -11,10 +12,14 @@ export interface PdfItem {
   file: File
 }
 
-function formatSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+/**
+ * The parts of a mouse or keyboard event that selection cares about, so the
+ * same handler serves clicks and Space/Enter.
+ */
+export interface SelectModifiers {
+  ctrlKey: boolean
+  metaKey: boolean
+  shiftKey: boolean
 }
 
 interface SortableFileItemProps {
@@ -25,7 +30,7 @@ interface SortableFileItemProps {
   dimmed: boolean
   /** Number badge shown on the dragged row when it carries a group. */
   dragCount?: number
-  onSelect: (e: MouseEvent) => void
+  onSelect: (e: SelectModifiers) => void
   onRemove: (id: string) => void
   disabled?: boolean
 }
@@ -54,17 +59,29 @@ export function SortableFileItem({
     transition,
   }
 
+  const handleKeyDown = (e: KeyboardEvent<HTMLLIElement>) => {
+    // Ignore keys aimed at the drag handle or the remove button.
+    if (e.target !== e.currentTarget) return
+    if (e.key !== " " && e.key !== "Enter") return
+    e.preventDefault()
+    onSelect(e)
+  }
+
   return (
     <li
       ref={setNodeRef}
       style={style}
       onClick={onSelect}
+      onKeyDown={handleKeyDown}
+      tabIndex={0}
+      role="option"
+      aria-selected={selected}
       data-selected={selected || undefined}
       className={cn(
-        "flex cursor-default items-center gap-2 p-3 transition-opacity",
+        "relative flex cursor-default items-center gap-2 p-3 transition-opacity outline-none focus-visible:z-10 focus-visible:ring-2 focus-visible:ring-ring/70",
         selected ? "bg-accent" : "bg-background",
         dimmed && "opacity-40",
-        isDragging && "relative z-10 rounded-md shadow-lg ring-1 ring-border",
+        isDragging && "z-10 rounded-md shadow-lg ring-1 ring-border",
       )}
     >
       {isDragging && dragCount != null && dragCount > 1 && (
@@ -95,7 +112,7 @@ export function SortableFileItem({
 
       <div className="min-w-0 flex-1">
         <p className="truncate text-sm font-medium">{item.file.name}</p>
-        <p className="text-xs text-muted-foreground">{formatSize(item.file.size)}</p>
+        <p className="text-xs text-muted-foreground">{formatBytes(item.file.size)}</p>
       </div>
 
       <Button

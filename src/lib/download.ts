@@ -1,3 +1,10 @@
+/**
+ * How long an object URL stays alive after the click. Firefox and Safari can
+ * cancel an in-flight download if the URL is revoked synchronously, so hold on
+ * to it well past the point the browser has committed to the save.
+ */
+const REVOKE_DELAY_MS = 60_000
+
 /** Trigger a browser download for a Blob or byte array. */
 export function downloadBlob(
   data: Blob | Uint8Array,
@@ -13,5 +20,6 @@ export function downloadBlob(
   document.body.appendChild(a)
   a.click()
   a.remove()
-  URL.revokeObjectURL(url)
+  // Deferred: revoking here would abort the download in Firefox/Safari.
+  setTimeout(() => URL.revokeObjectURL(url), REVOKE_DELAY_MS)
 }
