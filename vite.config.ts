@@ -1,3 +1,4 @@
+/// <reference types="vitest/config" />
 import path from "node:path"
 import { defineConfig } from "vite"
 import react from "@vitejs/plugin-react"
@@ -47,6 +48,10 @@ export default defineConfig(({ command }) => {
       alias: {
         "@": path.resolve(__dirname, "./src"),
       },
+    },
+    test: {
+      // Agent worktrees under .claude/worktrees contain duplicate test files.
+      exclude: ["**/node_modules/**", "**/dist/**", "**/.claude/**"],
     },
     build: {
       // jepub renders its templates through EJS with `client: true`. EJS embeds
