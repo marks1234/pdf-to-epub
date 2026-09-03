@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useMemo, useState } from "react"
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useDropzone } from "react-dropzone"
 import {
   DndContext,
@@ -20,46 +20,99 @@ import {
   BookOpen,
   CheckCircle2,
   Download,
+  Eye,
   FileText,
   HardDriveDownload,
   Inbox,
   Loader2,
   Merge,
   Palette,
+  Pencil,
+  RotateCcw,
   TriangleAlert,
   Trash2,
   UploadCloud,
+  X,
 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
+import { Progress } from "@/components/ui/progress"
+import { TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
   SortableFileItem,
   type PdfItem,
+  type SelectModifiers,
 } from "@/components/sortable-file-item"
+import { BookDetails, type BookDetailsValue } from "@/components/book-details"
+import { BookPreview } from "@/components/book-preview"
 import { MemoField } from "@/components/memo-field"
+import { RenameDialog } from "@/components/rename-dialog"
 import { StyleEditor } from "@/components/style-editor"
+import { ThemeToggle } from "@/components/theme-toggle"
 import { cn } from "@/lib/utils"
 import { mergePdfs, countPages } from "@/lib/merge-pdf"
-import { pdfToEpub, restyleEpub } from "@/lib/pdf-to-epub"
+import type { EpubMetadata, FileFailure } from "@/lib/pdf-to-epub"
 import { downloadBlob } from "@/lib/download"
-import { formatBytes, formatDate } from "@/lib/format"
+import { formatBytes, formatDate, sanitizeFilename } from "@/lib/format"
+import { pickSampleBlocks } from "@/lib/preview-sample"
+import type { Block } from "@/lib/reconstruct"
 import { moveGroup, rangeIds } from "@/lib/reorder"
-import { DEFAULT_STYLE_CONFIG, type StyleConfig } from "@/lib/styles"
-import { HISTORY_CAP, type OutputRecord } from "@/lib/storage"
+import { kindleSeriesTitle } from "@/lib/titles"
+import {
+  DEFAULT_STYLE_CONFIG,
+  validateStyleConfig,
+  type StyleConfig,
+} from "@/lib/styles"
+import {
+  HISTORY_CAP,
+  type OutputRecord,
+  type QueueDetails,
+  type StoredBookMeta,
+} from "@/lib/storage"
 import {
   analyzeSequence,
   extractNumber,
   formatNumberRanges,
   rangeBetween,
 } from "@/lib/sequence"
+import { isAbortError, useConverter } from "@/hooks/use-converter"
 import { useNameMemory } from "@/hooks/use-name-memory"
 import { useOutputs } from "@/hooks/use-outputs"
+import { useQueuePersistence } from "@/hooks/use-queue-persistence"
 import { useStyleProfiles } from "@/hooks/use-style-profiles"
+import { useTheme } from "@/hooks/use-theme"
 
 type Busy = "idle" | "merging" | "converting"
 
+/** Which pane the tab bar shows below the `lg` breakpoint. */
+type MobileTab = "queue" | "output"
+
+/** Identity of a queued file, used to skip re-adding the same PDF. */
+function fileKey(file: File): string {
+  return `${file.name}|${file.size}|${file.lastModified}`
+}
+
+/** What a finished conversion has to warn about — absent when it all went well. */
+interface ConvertSummary {
+  /** Files in the batch, so "N of M failed" can be stated. */
+  total: number
+  failures: FileFailure[]
+  emptyChapters: string[]
+}
+
 /** Largest gap span we annotate inline; bigger gaps are only shown in the banner. */
 const MAX_INLINE_GAP = 26
+
+/** Most names a summary banner spells out before summarising the rest. */
+const MAX_LISTED_NAMES = 5
+
+/** "a, b, c" — or "a, b, c, d, e and 7 more" once the list gets long. */
+function briefList(names: string[]): string {
+  if (names.length <= MAX_LISTED_NAMES) return names.join(", ")
+  return `${names.slice(0, MAX_LISTED_NAMES).join(", ")} and ${
+    names.length - MAX_LISTED_NAMES
+  } more`
+}
 
 /** localStorage key holding the style every new conversion starts from. */
 const DEFAULT_STYLE_KEY = "pdf2epub.default-style"
@@ -69,9 +122,7 @@ function loadDefaultStyle(): StyleConfig {
   try {
     const raw = localStorage.getItem(DEFAULT_STYLE_KEY)
     if (!raw) return DEFAULT_STYLE_CONFIG
-    const parsed = JSON.parse(raw) as StyleConfig
-    if (!parsed || !Array.isArray(parsed.rarities)) return DEFAULT_STYLE_CONFIG
-    return parsed
+    return validateStyleConfig(JSON.parse(raw)) ?? DEFAULT_STYLE_CONFIG
   } catch {
     return DEFAULT_STYLE_CONFIG
   }
@@ -84,12 +135,90 @@ function byNaturalName(a: PdfItem, b: PdfItem): number {
   })
 }
 
+const EMPTY_BOOK_DETAILS: BookDetailsValue = {
+  series: "",
+  seriesIndex: null,
+  language: "",
+  description: "",
+  cover: null,
+  kindleSeriesTitle: false,
+}
+
+/** Blank fields stay out of the metadata entirely rather than writing "". */
+function orUndefined(value: string): string | undefined {
+  return value.trim() || undefined
+}
+
+/**
+ * The `dc:title` to write. With the Kindle option on, the series name and a
+ * zero-padded index lead the title so title-sort keeps sideloaded volumes of one
+ * series together. The *download filename* deliberately keeps the plain title.
+ */
+function epubTitleFor(title: string, details: BookDetailsValue): string {
+  const series = details.series.trim()
+  if (!details.kindleSeriesTitle || !series || details.seriesIndex == null) {
+    return title
+  }
+  return kindleSeriesTitle(series, details.seriesIndex, title)
+}
+
+/** Snapshot the book details an EPUB build consumes, to store with the output. */
+function bookMetaFor(title: string, details: BookDetailsValue): StoredBookMeta {
+  return {
+    language: orUndefined(details.language),
+    description: orUndefined(details.description),
+    series: orUndefined(details.series),
+    seriesIndex: details.seriesIndex ?? undefined,
+    cover: details.cover ?? undefined,
+    epubTitle: epubTitleFor(title, details),
+  }
+}
+
+/**
+ * Expand a stored snapshot into the metadata a build wants. Shared by the first
+ * conversion and every later re-style, so a re-style cannot quietly drop the
+ * cover, language or series the book was made with. Records saved before the
+ * snapshot existed fall back to title and author alone.
+ */
+function epubMetaFrom(
+  meta: StoredBookMeta | undefined,
+  title: string,
+  author: string,
+  identifier: string,
+): EpubMetadata {
+  return {
+    title: meta?.epubTitle || title,
+    author: author || "Unknown",
+    language: meta?.language,
+    description: meta?.description,
+    series: meta?.series,
+    seriesIndex: meta?.seriesIndex,
+    cover: meta?.cover,
+    identifier,
+  }
+}
+
 export default function App() {
   const [items, setItems] = useState<PdfItem[]>([])
   const [title, setTitle] = useState("Merged Document")
   const [author, setAuthor] = useState("")
+  const [details, setDetails] = useState<BookDetailsValue>(EMPTY_BOOK_DETAILS)
   const [busy, setBusy] = useState<Busy>("idle")
   const [error, setError] = useState<string | null>(null)
+
+  /** Open state of the bulk-rename dialog. */
+  const [renaming, setRenaming] = useState(false)
+
+  /** Files ignored on the last drop because they were already queued. */
+  const [skippedDupes, setSkippedDupes] = useState(0)
+  /** Warnings from the last conversion; cleared when the next one starts. */
+  const [summary, setSummary] = useState<ConvertSummary | null>(null)
+  /** Single-pane switcher, only rendered below `lg`. */
+  const [mobileTab, setMobileTab] = useState<MobileTab>("queue")
+  /** Screen-reader announcements for selection and long-running work. */
+  const [announcement, setAnnouncement] = useState("")
+
+  const { theme, isDark, cycleTheme } = useTheme()
 
   /** Multi-select in the queue: ids, the last plainly-clicked row, the live drag. */
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set())
@@ -105,23 +234,115 @@ export default function App() {
   const authorMemory = useNameMemory("pdf2epub.authors")
   const history = useOutputs()
   const styleProfiles = useStyleProfiles()
+  // Conversion and re-styling both run in a worker; this owns its lifecycle.
+  const converter = useConverter()
+  const { progress } = converter
 
   const [styling, setStyling] = useState<OutputRecord | null>(null)
   const [restyleBusy, setRestyleBusy] = useState(false)
+  /** The EPUB being read in the preview dialog. */
+  const [previewing, setPreviewing] = useState<OutputRecord | null>(null)
+  /**
+   * An excerpt of the book the Style editor is open on, so the live preview
+   * shows that book's own stat sheets instead of the canned sample. Undefined
+   * while the chapters load (and for the default-style editor, which has none).
+   */
+  const [styleSample, setStyleSample] = useState<Block[] | undefined>(undefined)
+
+  const { loadChapters } = history
+  const stylingId = styling?.hasChapters ? styling.id : null
+
+  useEffect(() => {
+    setStyleSample(undefined)
+    if (!stylingId) return
+    let active = true
+    loadChapters(stylingId)
+      .then((chapters) => {
+        if (!active) return
+        const sample = pickSampleBlocks(chapters)
+        if (sample.length > 0) setStyleSample(sample)
+      })
+      .catch(() => {
+        // Not fatal — the editor just keeps showing its built-in sample.
+      })
+    return () => {
+      active = false
+    }
+  }, [stylingId, loadChapters])
+
+  const patchDetails = useCallback(
+    (patch: Partial<BookDetailsValue>) =>
+      setDetails((prev) => ({ ...prev, ...patch })),
+    [],
+  )
+
+  // Persisted alongside the queue so a reload keeps the whole book setup, not
+  // just the files. Memoized because the persistence effect debounces on it.
+  const queueDetails = useMemo<QueueDetails>(
+    () => ({
+      title,
+      author,
+      language: orUndefined(details.language),
+      description: orUndefined(details.description),
+      series: orUndefined(details.series),
+      seriesIndex: details.seriesIndex ?? undefined,
+      cover: details.cover ?? undefined,
+      kindleSeriesTitle: details.kindleSeriesTitle || undefined,
+    }),
+    [title, author, details],
+  )
+
+  const restoreQueue = useCallback(
+    (restored: PdfItem[], saved: QueueDetails) => {
+      setItems(restored)
+      if (saved.title) setTitle(saved.title)
+      if (saved.author) setAuthor(saved.author)
+      setDetails({
+        series: saved.series ?? "",
+        seriesIndex: saved.seriesIndex ?? null,
+        language: saved.language ?? "",
+        description: saved.description ?? "",
+        cover: saved.cover ?? null,
+        kindleSeriesTitle: saved.kindleSeriesTitle ?? false,
+      })
+    },
+    [],
+  )
+
+  const queue = useQueuePersistence({
+    items,
+    details: queueDetails,
+    // A conversion neither changes the queue nor should be landed on top of.
+    busy: busy !== "idle",
+    onRestore: restoreQueue,
+  })
 
   const applyStyle = async (out: OutputRecord, config: StyleConfig) => {
-    if (!out.chapters) return
+    setError(null)
     setRestyleBusy(true)
+    setAnnouncement("Applying styles…")
     try {
-      const blob = await restyleEpub(
-        out.chapters,
-        { title: out.title, author: out.author || "Unknown" },
+      // Chapter text lives in its own store now; pull it in on demand.
+      const chapters = out.chapters ?? (await history.loadChapters(out.id))
+      if (!chapters) return
+      // The record's id doubles as the book's stable `dc:identifier`, so a
+      // re-styled book replaces the old one on a device instead of joining it.
+      // The stored `meta` snapshot carries language, series, description and the
+      // cover across, so a re-style is not a quiet metadata reset.
+      const blob = await converter.restyle(
+        chapters,
+        epubMetaFrom(out.meta, out.title, out.author, out.id),
         config,
+        out.id,
       )
       await history.add({ ...out, blob, size: blob.size, style: config })
       setStyling(null)
+      setAnnouncement("Styles applied")
     } catch (e) {
+      // The dialog stays open so the user keeps their edits; the error is
+      // surfaced as a toast above it (the left-pane banner is covered).
       setError(e instanceof Error ? e.message : "Failed to apply styles.")
+      setAnnouncement("Applying styles failed")
     } finally {
       setRestyleBusy(false)
     }
@@ -132,18 +353,50 @@ export default function App() {
     [items],
   )
 
+  // Keep the live region in step with the selection.
+  useEffect(() => {
+    if (items.length === 0) return
+    setAnnouncement(`${selected.size} of ${items.length} selected`)
+  }, [selected, items.length])
+
+  /** Last ten-file milestone announced, so each one is spoken only once. */
+  const milestone = useRef(0)
+
+  // Announce progress every ten files. Speaking every file would flood the
+  // live region on a 90-file batch and drown out everything else.
+  useEffect(() => {
+    if (!progress || progress.phase !== "extract") return
+    const step = Math.floor(progress.done / 10)
+    if (step === 0 || step === milestone.current) return
+    milestone.current = step
+    setAnnouncement(`Converted ${progress.done} of ${progress.total} files`)
+  }, [progress])
+
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
   )
 
-  const onDrop = useCallback((accepted: File[]) => {
+  /** Queue dropped PDFs, skipping any file already in the queue. */
+  const onDrop = (accepted: File[]) => {
     setError(null)
-    setItems((prev) => [
-      ...prev,
-      ...accepted.map((file) => ({ id: crypto.randomUUID(), file })),
-    ])
-  }, [])
+    const seen = new Set(items.map((i) => fileKey(i.file)))
+    const fresh: PdfItem[] = []
+    let skipped = 0
+
+    for (const file of accepted) {
+      const key = fileKey(file)
+      if (seen.has(key)) {
+        skipped += 1
+        continue
+      }
+      seen.add(key)
+      fresh.push({ id: crypto.randomUUID(), file })
+    }
+
+    setSkippedDupes(skipped)
+    if (fresh.length > 0) setItems((prev) => [...prev, ...fresh])
+  }
 
   const { getRootProps, getInputProps, isDragActive, open } = useDropzone({
     onDrop,
@@ -152,8 +405,11 @@ export default function App() {
     noKeyboard: true,
   })
 
-  /** Click-to-select with shift ranges and ctrl/meta toggles, file-manager style. */
-  const handleSelect = (index: number, id: string, e: React.MouseEvent) => {
+  /**
+   * Select with shift ranges and ctrl/meta toggles, file-manager style. Driven
+   * by both clicks and Space/Enter on a focused row.
+   */
+  const handleSelect = (index: number, id: string, e: SelectModifiers) => {
     const additive = e.ctrlKey || e.metaKey
     if (e.shiftKey && anchor !== null) {
       const range = rangeIds(items, anchor, index)
@@ -218,6 +474,34 @@ export default function App() {
     setAnchor(null)
   }
 
+  /** Rebuild one item with (or without) a custom chapter title. */
+  const withTitle = (item: PdfItem, customTitle: string | undefined): PdfItem =>
+    customTitle ? { id: item.id, file: item.file, customTitle } : { id: item.id, file: item.file }
+
+  const renameItem = (id: string, customTitle: string | undefined) =>
+    setItems((prev) =>
+      prev.map((item) => (item.id === id ? withTitle(item, customTitle) : item)),
+    )
+
+  /** Rows a bulk rename applies to: the selection when there is one, else all. */
+  const renameTargets = useMemo(
+    () => (selected.size > 0 ? items.filter((i) => selected.has(i.id)) : items),
+    [items, selected],
+  )
+
+  /** Apply one title per rename target; `titles` is index-aligned with them. */
+  const applyBulkRename = (titles: string[]) => {
+    const byId = new Map(renameTargets.map((item, i) => [item.id, titles[i] ?? ""]))
+    setItems((prev) =>
+      prev.map((item) => {
+        const next = byId.get(item.id)
+        // Untargeted rows, and rows the pattern emptied, keep what they had.
+        if (next === undefined || !next.trim()) return item
+        return withTitle(item, next.trim())
+      }),
+    )
+  }
+
   const autoOrder = () =>
     setItems((prev) =>
       [...prev].sort((a, b) => {
@@ -233,6 +517,8 @@ export default function App() {
     setSelected(new Set())
     setAnchor(null)
     setError(null)
+    setSkippedDupes(0)
+    setSummary(null)
   }
 
   const rememberNames = () => {
@@ -243,6 +529,7 @@ export default function App() {
   const handleMerge = async () => {
     setError(null)
     setBusy("merging")
+    setAnnouncement("Merging PDFs…")
     try {
       const files = items.map((i) => i.file)
       const [bytes, pages] = await Promise.all([
@@ -253,7 +540,7 @@ export default function App() {
       await history.add({
         id: crypto.randomUUID(),
         kind: "pdf",
-        filename: `${title || "merged"}.pdf`,
+        filename: `${sanitizeFilename(title || "merged")}.pdf`,
         blob,
         title: title || "Merged Document",
         author,
@@ -263,8 +550,10 @@ export default function App() {
         createdAt: Date.now(),
       })
       rememberNames()
+      setAnnouncement("Merge complete")
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to merge PDFs.")
+      setAnnouncement("Merge failed")
     } finally {
       setBusy("idle")
     }
@@ -272,35 +561,66 @@ export default function App() {
 
   const handleConvert = async () => {
     setError(null)
+    setSummary(null)
     setBusy("converting")
+    milestone.current = 0
+
+    const files = items.map((i) => i.file)
+    setAnnouncement(
+      `Converting ${files.length} file${files.length === 1 ? "" : "s"}…`,
+    )
+
+    // Minted up front so the very first build already carries the identifier
+    // every later re-style reuses — one book to a device, not a new one each time.
+    const id = crypto.randomUUID()
+    const bookTitle = title || "Merged Document"
+    const meta = bookMetaFor(bookTitle, details)
+
     try {
-      const files = items.map((i) => i.file)
-      const pages = await countPages(files)
-      const { blob, chapters } = await pdfToEpub(
+      // Extraction already counts every page it opens, so the separate
+      // countPages() parse of the whole batch is pure duplicated work.
+      const result = await converter.convert(
         files,
-        {
-          title: title || "Merged Document",
-          author: author || "Unknown",
-        },
+        epubMetaFrom(meta, bookTitle, author, id),
         defaultStyle,
+        items.map((i) => i.customTitle?.trim() || undefined),
       )
       await history.add({
-        id: crypto.randomUUID(),
+        id,
         kind: "epub",
-        filename: `${title || "merged"}.epub`,
-        blob,
-        title: title || "Merged Document",
+        // The filename keeps the plain title even when dc:title is the Kindle
+        // series-sort form.
+        filename: `${sanitizeFilename(title || "merged")}.epub`,
+        blob: result.blob,
+        title: bookTitle,
         author,
         sources: files.map((f) => f.name),
-        pageCount: pages,
-        size: blob.size,
+        pageCount: result.pageCount,
+        size: result.blob.size,
         createdAt: Date.now(),
-        chapters,
+        chapters: result.chapters,
         style: defaultStyle,
+        meta,
       })
       rememberNames()
+      if (result.failures.length > 0 || result.emptyChapters.length > 0) {
+        setSummary({
+          total: files.length,
+          failures: result.failures,
+          emptyChapters: result.emptyChapters,
+        })
+      }
+      setAnnouncement(
+        `Converted ${result.chapters.length} chapters, ${result.failures.length} failures`,
+      )
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to convert to EPUB.")
+      // Cancelling is a choice, not a failure: reset without an error banner.
+      if (isAbortError(e)) {
+        setAnnouncement("Conversion cancelled")
+      } else {
+        setError(e instanceof Error ? e.message : "Failed to convert to EPUB.")
+        setAnnouncement("Conversion failed")
+      }
     } finally {
       setBusy("idle")
     }
@@ -316,7 +636,8 @@ export default function App() {
     setEditingDefault(false)
   }
 
-  const isBusy = busy !== "idle"
+  // A restyle counts as busy: it writes to history, so Merge/Convert must wait.
+  const isBusy = busy !== "idle" || restyleBusy
   const hasFiles = items.length > 0
   /** True while a multi-row selection is being dragged as one block. */
   const groupDrag =
@@ -337,21 +658,68 @@ export default function App() {
               your browser. No uploads.
             </p>
           </div>
-          <Button
-            variant="outline"
-            size="sm"
-            className="shrink-0"
-            onClick={() => setEditingDefault(true)}
-          >
-            <Palette className="size-4" />
-            Colors
-          </Button>
+          <div className="flex shrink-0 items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setEditingDefault(true)}
+            >
+              <Palette className="size-4" />
+              Colors
+            </Button>
+            <ThemeToggle theme={theme} onCycle={cycleTheme} />
+          </div>
         </div>
       </header>
 
+      {/* Screen-reader status: selection size and long-running work. */}
+      <div className="sr-only" role="status" aria-live="polite">
+        {announcement}
+      </div>
+
+      {/* Pane switcher — below lg only, where the split would halve both panes. */}
+      <div className="shrink-0 border-b p-2 lg:hidden">
+        <TabsList>
+          <TabsTrigger
+            active={mobileTab === "queue"}
+            aria-controls="pane-queue"
+            onClick={() => setMobileTab("queue")}
+          >
+            <FileText className="size-4" />
+            Queue
+            {items.length > 0 && (
+              <span className="text-xs tabular-nums opacity-70">
+                {items.length}
+              </span>
+            )}
+          </TabsTrigger>
+          <TabsTrigger
+            active={mobileTab === "output"}
+            aria-controls="pane-output"
+            onClick={() => setMobileTab("output")}
+          >
+            <HardDriveDownload className="size-4" />
+            Output
+            {history.outputs.length > 0 && (
+              <span className="text-xs tabular-nums opacity-70">
+                {history.outputs.length}
+              </span>
+            )}
+          </TabsTrigger>
+        </TabsList>
+      </div>
+
       <main className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-2">
         {/* LEFT — input & queue */}
-        <section className="flex min-h-0 flex-col overflow-hidden lg:border-r">
+        <section
+          id="pane-queue"
+          role="tabpanel"
+          aria-label="Queue"
+          className={cn(
+            "min-h-0 flex-col overflow-hidden lg:flex lg:border-r",
+            mobileTab === "queue" ? "flex" : "hidden",
+          )}
+        >
           <div className="flex min-h-0 flex-1 flex-col gap-3 p-4">
             {/* Dropzone */}
             <div
@@ -393,6 +761,44 @@ export default function App() {
               />
             </div>
 
+            {/* Optional metadata: series, language, description, cover */}
+            <BookDetails
+              value={details}
+              onChange={patchDetails}
+              title={title || "Merged Document"}
+              disabled={isBusy}
+            />
+
+            {/* Queue restored from the last session */}
+            {queue.restoredCount > 0 && (
+              <div className="flex shrink-0 items-start gap-2 rounded-lg border bg-muted/50 px-3 py-2 text-sm">
+                <RotateCcw className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+                <p className="flex-1">
+                  Restored {queue.restoredCount} file
+                  {queue.restoredCount === 1 ? "" : "s"} from your last session.
+                </p>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="-my-1 h-7 shrink-0"
+                  onClick={() => {
+                    clearAll()
+                    void queue.clear()
+                  }}
+                >
+                  Clear
+                </Button>
+                <button
+                  type="button"
+                  onClick={queue.dismissRestore}
+                  aria-label="Dismiss restored queue notice"
+                  className="-mr-1 shrink-0 rounded-sm p-0.5 opacity-70 transition-opacity hover:opacity-100 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+                >
+                  <X className="size-4" />
+                </button>
+              </div>
+            )}
+
             {/* Toolbar */}
             {hasFiles && (
               <div className="flex shrink-0 items-center justify-between gap-2">
@@ -427,6 +833,15 @@ export default function App() {
                   <Button
                     variant="outline"
                     size="sm"
+                    onClick={() => setRenaming(true)}
+                    disabled={isBusy}
+                  >
+                    <Pencil className="size-4" />
+                    Rename {selected.size > 0 ? "selected" : "all"}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
                     onClick={autoOrder}
                     disabled={isBusy}
                   >
@@ -443,6 +858,62 @@ export default function App() {
                     Clear all
                   </Button>
                 </div>
+              </div>
+            )}
+
+            {/* Duplicates skipped on the last drop */}
+            {skippedDupes > 0 && (
+              <div className="flex shrink-0 items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300">
+                <TriangleAlert className="mt-0.5 size-4 shrink-0" />
+                <p className="flex-1">
+                  Skipped {skippedDupes} duplicate file
+                  {skippedDupes === 1 ? "" : "s"} — already in the queue.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => setSkippedDupes(0)}
+                  aria-label="Dismiss duplicate notice"
+                  className="-mr-1 shrink-0 rounded-sm p-0.5 opacity-70 transition-opacity hover:opacity-100 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+                >
+                  <X className="size-4" />
+                </button>
+              </div>
+            )}
+
+            {/* What the last conversion could not do */}
+            {summary && (
+              <div className="flex shrink-0 items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300">
+                <TriangleAlert className="mt-0.5 size-4 shrink-0" />
+                <div className="min-w-0 flex-1 space-y-0.5">
+                  {summary.failures.length > 0 && (
+                    <p>
+                      {summary.failures.length} of {summary.total} files failed:{" "}
+                      <span className="font-semibold">
+                        {briefList(summary.failures.map((f) => f.name))}
+                      </span>
+                      .
+                    </p>
+                  )}
+                  {summary.emptyChapters.length > 0 && (
+                    <p>
+                      {summary.emptyChapters.length} chapter
+                      {summary.emptyChapters.length === 1 ? "" : "s"} had no
+                      extractable text (scanned images?):{" "}
+                      <span className="font-semibold">
+                        {briefList(summary.emptyChapters)}
+                      </span>
+                      .
+                    </p>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSummary(null)}
+                  aria-label="Dismiss conversion summary"
+                  className="-mr-1 shrink-0 rounded-sm p-0.5 opacity-70 transition-opacity hover:opacity-100 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+                >
+                  <X className="size-4" />
+                </button>
               </div>
             )}
 
@@ -500,7 +971,12 @@ export default function App() {
                     items={items.map((i) => i.id)}
                     strategy={verticalListSortingStrategy}
                   >
-                    <ul className="divide-y select-none">
+                    <ul
+                      className="divide-y select-none"
+                      role="listbox"
+                      aria-multiselectable="true"
+                      aria-label="Queued PDF files"
+                    >
                       {items.map((item, index) => {
                         const cur = seq.numbers[index]
                         const next = seq.numbers[index + 1]
@@ -533,10 +1009,14 @@ export default function App() {
                                 handleSelect(index, item.id, e)
                               }
                               onRemove={removeItem}
+                              onRename={renameItem}
                               disabled={isBusy}
                             />
                             {gap && (
-                              <li className="flex items-center justify-center gap-1.5 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-700 dark:bg-amber-950/40 dark:text-amber-400">
+                              <li
+                                role="presentation"
+                                className="flex items-center justify-center gap-1.5 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-700 dark:bg-amber-950/40 dark:text-amber-400"
+                              >
                                 <TriangleAlert className="size-3.5" />
                                 Missing {(seq.label ?? "number").toLowerCase()}
                                 {gap.length > 1 ? "s" : ""}{" "}
@@ -561,6 +1041,47 @@ export default function App() {
 
           {/* Pinned action bar */}
           <div className="shrink-0 border-t bg-background p-3">
+            {/*
+              Live conversion state. Rendered for the whole run, not just once
+              the first progress message lands, so the panel never flickers in.
+            */}
+            {busy === "converting" && (
+              <div className="mb-3 space-y-2 rounded-lg border bg-muted/40 p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <p className="min-w-0 text-sm font-medium">
+                    {progress?.phase === "build"
+                      ? "Building EPUB…"
+                      : `Converting chapter ${Math.min(
+                          (progress?.done ?? 0) + 1,
+                          progress?.total ?? items.length,
+                        )} of ${progress?.total ?? items.length}`}
+                  </p>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="shrink-0"
+                    onClick={converter.cancel}
+                  >
+                    <X className="size-4" />
+                    Cancel
+                  </Button>
+                </div>
+                <Progress
+                  value={
+                    progress && progress.total > 0
+                      ? (progress.done / progress.total) * 100
+                      : 0
+                  }
+                  aria-label="Conversion progress"
+                />
+                {progress?.currentName && (
+                  <p className="truncate text-xs text-muted-foreground">
+                    {progress.currentName}
+                  </p>
+                )}
+              </div>
+            )}
+
             {error && (
               <p className="mb-2 text-sm font-medium text-destructive" role="alert">
                 {error}
@@ -579,12 +1100,9 @@ export default function App() {
                 )}
                 Merge PDF
               </Button>
+              {/* No spinner here: the progress panel above carries the state. */}
               <Button onClick={handleConvert} disabled={!hasFiles || isBusy}>
-                {busy === "converting" ? (
-                  <Loader2 className="size-4 animate-spin" />
-                ) : (
-                  <BookOpen className="size-4" />
-                )}
+                <BookOpen className="size-4" />
                 Convert to EPUB
               </Button>
             </div>
@@ -592,7 +1110,15 @@ export default function App() {
         </section>
 
         {/* RIGHT — output history */}
-        <section className="flex min-h-0 flex-col overflow-hidden border-t lg:border-t-0">
+        <section
+          id="pane-output"
+          role="tabpanel"
+          aria-label="Output"
+          className={cn(
+            "min-h-0 flex-col overflow-hidden lg:flex",
+            mobileTab === "output" ? "flex" : "hidden",
+          )}
+        >
           <div className="flex shrink-0 items-center justify-between gap-2 border-b px-4 py-3">
             <div>
               <h2 className="flex items-center gap-2 font-semibold">
@@ -666,6 +1192,18 @@ export default function App() {
                       </div>
                     </div>
                     <div className="mt-3 flex justify-end gap-2">
+                      {/* Both need the stored chapter text: one to re-render it,
+                          the other to re-style it. */}
+                      {out.kind === "epub" && out.hasChapters && (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => setPreviewing(out)}
+                        >
+                          <Eye className="size-4" />
+                          Preview
+                        </Button>
+                      )}
                       {out.kind === "epub" && (
                         <Button
                           variant="outline"
@@ -703,19 +1241,66 @@ export default function App() {
         </section>
       </main>
 
+      {renaming && (
+        <RenameDialog
+          open={renaming}
+          onOpenChange={setRenaming}
+          targets={renameTargets.map((i) => i.file.name)}
+          selectionOnly={selected.size > 0}
+          onApply={applyBulkRename}
+        />
+      )}
+
+      {previewing && (
+        <BookPreview
+          open={!!previewing}
+          onOpenChange={(o) => !o && setPreviewing(null)}
+          outputId={previewing.id}
+          filename={previewing.filename}
+          title={previewing.title}
+          config={previewing.style ?? DEFAULT_STYLE_CONFIG}
+          loadChapters={history.loadChapters}
+          initialDark={isDark}
+        />
+      )}
+
       {styling && (
         <StyleEditor
           open={!!styling}
           onOpenChange={(o) => !o && setStyling(null)}
           filename={styling.filename}
           initialConfig={styling.style ?? DEFAULT_STYLE_CONFIG}
-          canRestyle={!!styling.chapters}
+          canRestyle={!!styling.hasChapters}
           profiles={styleProfiles.profiles}
           busy={restyleBusy}
+          sampleBlocks={styleSample}
           onApply={(config) => void applyStyle(styling, config)}
           onSaveProfile={(name, config) => void styleProfiles.save(name, config)}
           onDeleteProfile={(id) => void styleProfiles.remove(id)}
         />
+      )}
+
+      {/*
+        The dialog covers the left pane's error slot, so a failed restyle also
+        gets a toast above it. (A banner inside the dialog would mean editing
+        style-editor.tsx, which this change deliberately leaves alone.)
+      */}
+      {styling && error && (
+        <div
+          role="alert"
+          className="fixed inset-x-0 bottom-4 z-[60] mx-auto flex w-[min(90vw,32rem)] items-start gap-2 rounded-lg border border-destructive/40 bg-background px-3 py-2 text-sm font-medium text-destructive shadow-lg"
+        >
+          <TriangleAlert className="mt-0.5 size-4 shrink-0" />
+          <p className="flex-1">{error}</p>
+          <button
+            type="button"
+            onClick={() => setError(null)}
+            aria-label="Dismiss error"
+            className="-mr-1 shrink-0 rounded-sm p-0.5 opacity-70 transition-opacity hover:opacity-100 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+          >
+            <X className="size-4" />
+          </button>
+        </div>
       )}
 
       {editingDefault && (
