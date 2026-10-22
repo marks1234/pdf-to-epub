@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useState } from "react"
 
+import type { Chapter } from "@/lib/pdf-to-epub"
 import {
   addOutput,
   clearAllOutputs,
   deleteOutput,
   getAllOutputs,
+  getChapters,
   getStorageEstimate,
   requestPersistence,
   type OutputRecord,
@@ -62,5 +64,24 @@ export function useOutputs() {
     await refresh()
   }, [refresh])
 
-  return { outputs, estimate, persisted, ready, add, remove, clear }
+  /**
+   * Pull one output's chapter text in on demand. Listed records omit it (the
+   * `hasChapters` flag says whether there is any) so that listing the history
+   * never deserializes every stored book.
+   */
+  const loadChapters = useCallback(
+    async (id: string): Promise<Chapter[] | undefined> => getChapters(id),
+    [],
+  )
+
+  return {
+    outputs,
+    estimate,
+    persisted,
+    ready,
+    add,
+    remove,
+    clear,
+    loadChapters,
+  }
 }

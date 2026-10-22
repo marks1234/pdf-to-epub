@@ -9,7 +9,25 @@
       name="description"
       content="Merge PDF files and convert them to EPUB — entirely in your browser."
     />
+    <meta name="color-scheme" content="light dark" />
     <title>PDF Merge & EPUB</title>
+    <script>
+      // Apply the saved theme before first paint so dark mode never flashes
+      // white. Kept in sync with src/hooks/use-theme.ts ("pdf2epub.theme").
+      (function () {
+        try {
+          var saved = localStorage.getItem("pdf2epub.theme")
+          var dark =
+            saved === "dark" ||
+            ((!saved || saved === "system") &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches)
+          document.documentElement.classList.toggle("dark", dark)
+          document.documentElement.style.colorScheme = dark ? "dark" : "light"
+        } catch (e) {
+          // Storage or matchMedia unavailable — React applies the theme later.
+        }
+      })()
+    </script>
   </head>
   <body>
     <div id="root"></div>

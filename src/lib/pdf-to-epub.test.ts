@@ -5,7 +5,7 @@ import {
   blocksToHtml,
   type Block,
   type ReconstructedLine,
-} from "./pdf-to-epub"
+} from "./reconstruct"
 
 /**
  * Build single-spaced lines from top to bottom (PDF Y grows upward, so each
