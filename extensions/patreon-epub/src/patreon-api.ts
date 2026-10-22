@@ -42,6 +42,8 @@ export interface CollectionInfo {
   posts: PostRef[]
   coverUrl?: string
   creator?: string
+  /** `post_sort_type`: which way `postIds` runs. */
+  sortType?: string
 }
 
 /** One post's content, as the API returned it. */
@@ -72,8 +74,11 @@ export function postsListUrl(collectionId: string, withSort: boolean, pageSize?:
 
 export function collectionUrl(collectionId: string): string {
   const q = new URLSearchParams()
-  q.set("include", "posts,campaign")
-  q.set("fields[post]", LIST_FIELDS)
+  // Light request: only the collection fields we read, plus the campaign name.
+  // No included posts — titles come from the per-post fetch.
+  q.set("fields[collection]", "title,description,num_posts,post_ids,post_sort_type,thumbnail")
+  q.set("include", "campaign")
+  q.set("fields[campaign]", "name,vanity")
   q.set("json-api-version", "1.0")
   return `${ORIGIN}/api/collection/${collectionId}?${q}`
 }
@@ -220,6 +225,7 @@ export function parseCollection(json: unknown): CollectionInfo {
     posts,
     coverUrl,
     creator,
+    sortType: str(a.post_sort_type),
   }
 }
 
@@ -246,7 +252,33 @@ export function parsePost(json: unknown): PostContent {
 // ── Listing with fallbacks ───────────────────────────────────────────────────
 
 /** How a listing is ordered, which decides how it is normalized. */
-export type ListingOrder = "collection" | "unordered" | "newest-first"
+export type ListingOrder =
+  | "collection"
+  /** Collection order known (from `post_sort_type`) to run oldest first. */
+  | "collection-asc"
+  /** Collection order known (from `post_sort_type`) to run newest first. */
+  | "collection-desc"
+  | "unordered"
+  | "newest-first"
+
+/**
+ * Map Patreon's `post_sort_type` to a listing order. Explicit desc/newest
+ * values reverse; asc/oldest and creator-arranged orders keep; anything else
+ * is plain "collection" (kept unless dates/titles clearly say newest-first).
+ */
+export function orderFromSortType(sortType: string | undefined): ListingOrder {
+  const s = (sortType ?? "").toLowerCase()
+  if (/desc|newest|latest|reverse/.test(s)) return "collection-desc"
+  if (/asc|oldest|earliest|custom|manual|collection_order|creator/.test(s)) return "collection-asc"
+  return "collection"
+}
+
+/** Does the collection's own `post_ids` match `num_posts` closely enough to trust? */
+export function postIdsMatchCount(ids: number, numPosts: number | undefined): boolean {
+  if (ids === 0) return false
+  if (numPosts === undefined) return true
+  return Math.abs(ids - numPosts) <= Math.max(5, numPosts * 0.05)
+}
 
 export interface Listing {
   posts: PostRef[]
@@ -334,7 +366,8 @@ async function listViaPostsApi(
     } catch (e) {
       if (isAbort(e)) throw e
       const s = statusOf(e)
-      if (page === 0 && pageSize && (s === 400 || s === 422)) {
+      // A 400 means the collection filter itself is unsupported — no variant will help.
+      if (page === 0 && pageSize && s === 422) {
         deps.log?.(`posts api: page[count] rejected (${s}), retrying without it`)
         pageSize = 0
         url = postsListUrl(collectionId, withSort)
@@ -396,8 +429,15 @@ export async function listCollection(collectionId: string, deps: ListingDeps): P
     return out
   }
 
+  // The collection's own post_ids, in its own order, close to num_posts (which
+  // may undercount hidden/draft items): accept with no /api/posts listing calls.
+  if (collection && postIdsMatchCount(collection.postIds.length, collection.postCount ?? deps.expectedCount)) {
+    const order = orderFromSortType(collection.sortType)
+    log(`collection post_ids accepted (sort=${collection.sortType ?? "?"} -> ${order})`)
+    return finish({ posts: collection.posts, order, source: "collection-api" })
+  }
   if (collection && plausibleListing(collection.posts, deps.visibleIds, expected)) {
-    const c: Listing = { posts: collection.posts, order: "collection", source: "collection-api" }
+    const c: Listing = { posts: collection.posts, order: orderFromSortType(collection.sortType), source: "collection-api" }
     if (expected && collection.posts.length === expected && collection.posts.every((p) => p.title)) return finish(c)
     candidates.push(c)
   }
@@ -428,7 +468,8 @@ export async function listCollection(collectionId: string, deps: ListingDeps): P
         log(`${name} failed: ${errText(e)}`)
         const s = statusOf(e)
         // Only a rejected sort is worth an unsorted pass; anything else would repeat.
-        if (!(withSort && (s === 400 || s === 404 || s === 422))) break
+        // A 400 means the filter is unsupported, so an unsorted pass would 400 too.
+        if (!(withSort && (s === 404 || s === 422))) break
       }
     }
   }
@@ -542,6 +583,8 @@ export function orderOldestFirst(posts: PostRef[], order: ListingOrder): PostRef
   const dates = posts.map(dateOf)
   const nums = posts.map(chapterNumberOf)
 
+  if (order === "collection-asc") return [...posts]
+  if (order === "collection-desc") return [...posts].reverse()
   if (order === "collection") {
     return looksNewestFirst(dates, nums) ? [...posts].reverse() : [...posts]
   }
