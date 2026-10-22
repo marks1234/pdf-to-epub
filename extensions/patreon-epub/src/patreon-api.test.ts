@@ -3,7 +3,9 @@ import { describe, it, expect, vi } from "vitest"
 import { HttpError } from "./http"
 import {
   cleanChapterTitle,
+  collectionUrl,
   listCollection,
+  orderFromSortType,
   orderOldestFirst,
   parseCollection,
   parsePost,
@@ -125,13 +127,13 @@ describe("listCollection", () => {
     expect(listing.posts.map((p) => p.id)).toEqual(["1"])
   })
 
-  it("falls back to the unsorted listing when sort is rejected", async () => {
+  it("falls back to the unsorted listing when sort is rejected with 422", async () => {
     const unsorted = postsListUrl("9", false)
     const d = deps({
       fetchJson: async (url: string) => {
         if (url === unsorted) return { data: [post("3", "Chapter 3", "2026-01-03"), post("1", "Chapter 1", "2026-01-01")] }
         if (url.includes("/api/collection/")) return { data: { id: "9", attributes: {} } }
-        throw new Error("HTTP 400")
+        throw new Error("HTTP 422")
       },
     })
     const listing = await listCollection("9", d)
@@ -241,22 +243,19 @@ describe("listCollection (bounded, complete)", () => {
     expect(listing.posts).toHaveLength(178)
   })
 
-  it("a 400 on page[count] retries still sorted; a 400 on sort retries unsorted", async () => {
+  it("the posts-API fallback stops after the first 400", async () => {
     const calls: string[] = []
     const listing = await listCollection("9", {
       fetchJson: async (url) => {
         calls.push(url)
         if (url.includes("/api/collection/")) return { data: { id: "9", attributes: {} } }
-        if (url.includes("page%5Bcount%5D") || url.includes("sort=")) throw new HttpError(400, url)
-        return { data: [post("3", "C3", "2026-01-03")] }
+        throw new HttpError(400, url)
       },
-      harvestPage: harvest,
+      harvestPage: async () => ["3"],
       visibleIds: ["3"],
     })
-    expect(listing.source).toBe("posts-api-unsorted")
-    expect(calls[1]).toContain("page%5Bcount%5D=100")
-    expect(calls[2]).toContain("sort=")
-    expect(calls[2]).not.toContain("page%5Bcount%5D")
+    expect(listing.source).toBe("page")
+    expect(calls.filter((u) => u.includes("/api/posts"))).toHaveLength(1)
   })
 
   it("short posts listing + full collection: the longer one wins", async () => {
@@ -332,6 +331,65 @@ describe("pagination drift", () => {
     })
     expect(listing.truncated).toBe(true)
     expect(listing.incomplete).toBeDefined()
+  })
+})
+
+describe("collection post_ids fast path", () => {
+  const ids = (n: number) => Array.from({ length: n }, (_, i) => String(i + 1))
+  const run = async (postIds: string[], numPosts: number, sort?: string) => {
+    const calls: string[] = []
+    const listing = await listCollection("9", {
+      fetchJson: async (url) => {
+        calls.push(url)
+        if (url.includes("/api/collection/"))
+          return { data: { id: "9", attributes: { title: "Book", num_posts: numPosts, post_ids: postIds, ...(sort ? { post_sort_type: sort } : {}) } } }
+        return { data: postIds.map((id) => post(id, `C${id}`, "2026-01-01")) }
+      },
+      harvestPage: async () => [],
+      visibleIds: ["1"],
+    })
+    return { listing, postsCalls: calls.filter((u) => u.includes("/api/posts")) }
+  }
+
+  it("305 ids vs num_posts=304 is accepted with zero /api/posts calls", async () => {
+    const { listing, postsCalls } = await run(ids(305), 304)
+    expect(listing.source).toBe("collection-api")
+    expect(listing.posts).toHaveLength(305)
+    expect(postsCalls).toHaveLength(0)
+  })
+
+  it("50 ids vs num_posts=304 falls back to the posts API", async () => {
+    const { postsCalls } = await run(ids(50), 304)
+    expect(postsCalls.length).toBeGreaterThan(0)
+  })
+
+  it("the collection URL is light: no included posts", () => {
+    const u = new URL(collectionUrl("9"))
+    expect(u.searchParams.get("include")).toBe("campaign")
+    expect(u.searchParams.get("fields[collection]")).toContain("post_ids")
+    expect(u.searchParams.has("fields[post]")).toBe(false)
+  })
+
+  it("post_sort_type decides the order", async () => {
+    const asc = await run(ids(3), 3, "collection_order_asc")
+    expect(asc.listing.order).toBe("collection-asc")
+    expect(orderOldestFirst(asc.listing.posts, asc.listing.order).map((p) => p.id)).toEqual(["1", "2", "3"])
+    const desc = await run(ids(3), 3, "published_at_desc")
+    expect(desc.listing.order).toBe("collection-desc")
+    expect(orderOldestFirst(desc.listing.posts, desc.listing.order).map((p) => p.id)).toEqual(["3", "2", "1"])
+    expect(orderFromSortType("collection_order")).toBe("collection-asc")
+    expect(orderFromSortType("something_new")).toBe("collection")
+    expect(orderFromSortType(undefined)).toBe("collection")
+  })
+
+  it("unknown sort type keeps the given order unless dates say newest-first", () => {
+    const newestFirst: PostRef[] = [
+      { id: "3", publishedAt: "2026-01-03" },
+      { id: "2", publishedAt: "2026-01-02" },
+      { id: "1", publishedAt: "2026-01-01" },
+    ]
+    expect(orderOldestFirst(newestFirst, orderFromSortType("weird")).map((p) => p.id)).toEqual(["1", "2", "3"])
+    expect(orderOldestFirst([{ id: "a" }, { id: "b" }], orderFromSortType("weird")).map((p) => p.id)).toEqual(["a", "b"])
   })
 })
 

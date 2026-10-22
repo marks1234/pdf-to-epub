@@ -113,6 +113,10 @@ async function openPanel(): Promise<void> {
   return st.listingPromise
 }
 
+/** Title of a chapter saved by an earlier visit (the listing itself carries no titles). */
+const cachedTitle = (r: unknown): string | undefined =>
+  r && typeof r === "object" && typeof (r as { title?: unknown }).title === "string" ? (r as { title: string }).title : undefined
+
 function showReady(st: State, p: Panel): void {
   const l = st.listing
   const note =
@@ -131,7 +135,7 @@ function showReady(st: State, p: Panel): void {
   const saved = st.posts.filter((x) => st.cache.get(x.id)?.ok).length
   p.showReady(
     st.bookTitle,
-    st.posts.map((x) => ({ label: `${x.title || `Post ${x.id}`}${x.canView === false ? " (locked)" : ""}` })),
+    st.posts.map((x, i) => ({ label: `${x.title || cachedTitle(st.cache.get(x.id)) || `Post ${i + 1}`}${x.canView === false ? " (locked)" : ""}` })),
     note,
     {
       saved,
