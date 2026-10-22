@@ -5,6 +5,8 @@
  * content-script CSP forbids).
  */
 import type { Chapter } from "@/lib/epub-book"
+import type { Block } from "@/lib/reconstruct"
+import { sanitizeFilename } from "@/lib/format"
 import { createStyler, DEFAULT_STYLE_CONFIG } from "@/lib/styles"
 
 import { writeEpub, type WriterMeta } from "./epub-writer"
@@ -23,10 +25,21 @@ export interface BookRequest {
 }
 
 /** One fetched post → one chapter. Returns null when the body has no text. */
-export function postToChapter(post: { title: string; html: string }, bookTitle?: string): Chapter | null {
-  const blocks = htmlToBlocks(post.html)
+export function postToChapter(post: { title: string; html: string; blocks?: Block[] }, bookTitle?: string): Chapter | null {
+  // Non-empty HTML wins; otherwise the blocks parsed from `content_json_string`.
+  const blocks = post.html.trim() ? htmlToBlocks(post.html) : (post.blocks ?? [])
   if (blocks.every((b) => b.type === "hr")) return null
   return { title: cleanChapterTitle(post.title, bookTitle), blocks }
+}
+
+/**
+ * `<title>.epub`, or `<title> (from-to).epub` for a partial range. The title is
+ * truncated before the suffix is added, so a long title never loses the range.
+ */
+export function bookFilename(title: string, range?: [number, number]): string {
+  const suffix = range ? ` (${range[0]}-${range[1]})` : ""
+  const stem = sanitizeFilename(title).slice(0, 120 - suffix.length).replace(/[.\s]+$/, "")
+  return `${stem || "untitled"}${suffix}.epub`
 }
 
 /** Is this a JPEG or PNG? (The only cover formats worth handing to Kindle.) */
@@ -48,12 +61,10 @@ export async function buildBook(req: BookRequest): Promise<{ blob: Blob; coverDr
     notes: req.notes,
     language: "en",
   }
-  const cover = req.cover && isJpegOrPng(req.cover) ? req.cover : undefined
-  try {
-    return { blob: await writeEpub(req.chapters, { ...meta, cover }, styler), coverDropped: false }
-  } catch (e) {
-    if (!cover) throw e
-    // A cover the writer can't take shouldn't cost the whole book.
-    return { blob: await writeEpub(req.chapters, meta, styler), coverDropped: true }
-  }
+  // Gate the cover up front, so a writer error is never "retry without cover"
+  // (which used to build every chapter twice).
+  const cover = req.cover && isJpegOrPng(req.cover) && req.cover.byteLength <= MAX_COVER_BYTES ? req.cover : undefined
+  return { blob: await writeEpub(req.chapters, { ...meta, cover }, styler), coverDropped: !!req.cover && !cover }
 }
+
+const MAX_COVER_BYTES = 5_000_000

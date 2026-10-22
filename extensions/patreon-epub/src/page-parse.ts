@@ -9,9 +9,35 @@
  */
 import { decodeEntities } from "./html-to-blocks"
 
-/** `/collection/552396` → "552396". */
+/** `/collection/552396`, `/collection/my-book-552396`, `/cw/x/collection/552396/` → "552396". */
 export function collectionIdFromPath(pathname: string): string | null {
-  return /^\/collection\/(\d+)(?:\/|$)/.exec(pathname)?.[1] ?? null
+  return /\/collection\/(?:[^/]*?-)?(\d+)(?:[/-]|$)/.exec(pathname)?.[1] ?? null
+}
+
+/**
+ * The post id of any Patreon post link (query ignored, origin required):
+ * `/posts/123`, `/posts/chapter-476-123?utm=…`. Not collection-filtered.
+ */
+export function postIdOf(href: string, base = "https://www.patreon.com"): string | null {
+  let u: URL
+  try {
+    u = new URL(href, base)
+  } catch {
+    return null
+  }
+  if (!/^(www\.)?patreon\.com$/i.test(u.hostname)) return null
+  return /\/posts\/(?:[^/]*-)?(\d+)\/?$/.exec(u.pathname)?.[1] ?? null
+}
+
+/** Cover images are only fetched from Patreon itself or its CDN. */
+export function acceptCoverUrl(url: string | undefined): url is string {
+  if (!url) return false
+  try {
+    const u = new URL(url)
+    return u.protocol === "https:" && (u.hostname === "www.patreon.com" || u.hostname.endsWith(".patreonusercontent.com"))
+  } catch {
+    return false
+  }
 }
 
 export interface CollectionTitleInfo {
@@ -30,8 +56,11 @@ export function parseCollectionDocTitle(docTitle: string): CollectionTitleInfo {
   const fromIdx = parts.findIndex((p) => /^collection from\s+/i.test(p))
   if (fromIdx > 0) info.title = parts.slice(0, fromIdx).join(" | ")
   if (fromIdx >= 0) info.creator = parts[fromIdx].replace(/^collection from\s+/i, "").trim() || undefined
-  const count = parts.map((p) => /^(\d[\d,]*)\s+posts?$/i.exec(p)).find(Boolean)
-  if (count) info.postCount = parseInt(count[1].replace(/,/g, ""), 10)
+  // "178 posts", "178 Beiträge", "1.234 publicaciones": any "<number> <word>"
+  // part after the creator (so a title like "300 Spartans" can't match).
+  const countParts = fromIdx >= 0 ? parts.slice(fromIdx + 1) : parts.slice(1)
+  const count = countParts.map((p) => /^(\d[\d.,\s]*)\s+\p{L}+$/u.exec(p)).find(Boolean)
+  if (count) info.postCount = parseInt(count[1].replace(/\D/g, ""), 10)
   return info
 }
 
@@ -94,13 +123,16 @@ function tagStartBefore(html: string, at: number): number {
  * starts with `RichText-module` inside `.patreon-post-content`.
  */
 export function postBodyFromPageHtml(html: string): string | null {
-  const wrapper = /class\s*=\s*["'][^"']*\bpatreon-post-content\b/i.exec(html)
-  const from = wrapper ? wrapper.index : 0
-  const rich = /class\s*=\s*["'](?:[^"']*\s)?RichText-module/g
-  rich.lastIndex = from
-  const m = rich.exec(html)
+  // Only inside the post-content wrapper: elsewhere a RichText block is the
+  // about blurb, a tier description or a comment, never the chapter.
+  const wrapper =
+    /class\s*=\s*["'][^"']*\bpatreon-post-content\b/i.exec(html) ?? /data-tag\s*=\s*["']post-content["']/i.exec(html)
+  if (!wrapper) return null
+  const inner = innerHtmlAt(html, tagStartBefore(html, wrapper.index))
+  if (inner == null) return null
+  const m = /class\s*=\s*["'](?:[^"']*\s)?RichText-module/.exec(inner)
   if (!m) return null
-  return innerHtmlAt(html, tagStartBefore(html, m.index))
+  return innerHtmlAt(inner, tagStartBefore(inner, m.index))
 }
 
 /** The post title from `[data-tag="post-title"]`, as plain text. */

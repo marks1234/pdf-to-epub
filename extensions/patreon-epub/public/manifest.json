@@ -1,14 +1,22 @@
 {
   "manifest_version": 3,
   "name": "Patreon Collection to EPUB",
-  "version": "0.1.0",
+  "version": "0.2.0",
+  "minimum_chrome_version": "116",
   "description": "Save a Patreon collection you have access to as one EPUB, for personal offline reading.",
+  "permissions": ["storage", "unlimitedStorage"],
   "host_permissions": ["https://www.patreon.com/*"],
   "content_scripts": [
     {
       "matches": ["https://www.patreon.com/*"],
       "js": ["content.js"],
       "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["app.js"],
+      "matches": ["https://www.patreon.com/*"]
     }
   ]
 }

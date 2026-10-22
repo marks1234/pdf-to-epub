@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest"
+import { describe, it, expect, vi } from "vitest"
 import JSZip from "jszip"
 
 import { buildBook, isJpegOrPng, postToChapter } from "./build"
@@ -54,6 +54,22 @@ describe("buildBook", () => {
     const opf = await zip.file(names.find((n) => n.endsWith(".opf")) as string)!.async("string")
     expect(opf).toContain("patreon-collection-9")
     expect(opf).toContain("Writer")
+  })
+
+  it("a writer error is not retried (writeEpub runs exactly once)", async () => {
+    const writer = await import("./epub-writer")
+    const spy = vi.spyOn(writer, "writeEpub").mockRejectedValueOnce(new Error("boom"))
+    const cover = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3]).buffer
+    const chapters = [postToChapter({ title: "C1", html: "<p>x</p>" })!]
+    await expect(buildBook({ title: "B", author: "A", identifier: "id", chapters, cover })).rejects.toThrow("boom")
+    expect(spy).toHaveBeenCalledTimes(1)
+    spy.mockRestore()
+  })
+
+  it("drops an oversized or non-JPEG/PNG cover up front", async () => {
+    const chapters = [postToChapter({ title: "C1", html: "<p>x</p>" })!]
+    const webp = new TextEncoder().encode("RIFF....WEBP").buffer as ArrayBuffer
+    expect((await buildBook({ title: "B", author: "A", identifier: "id", chapters, cover: webp })).coverDropped).toBe(true)
   })
 
   it("drops a cover the builder rejects instead of failing", async () => {

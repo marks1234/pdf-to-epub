@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest"
 
 import {
+  acceptCoverUrl,
+  postIdOf,
   collectionIdFromPath,
   parseCollectionDocTitle,
   postBodyFromPageHtml,
@@ -36,6 +38,18 @@ describe("post page parsing", () => {
     expect(postBodyFromPageHtml("<html><div id='root'></div></html>")).toBeNull()
     expect(postTitleFromPageHtml("<html></html>")).toBeNull()
   })
+
+  it("only takes RichText inside the post-content wrapper", () => {
+    expect(postBodyFromPageHtml('<div class="RichText-module__a__root"><p>About the creator</p></div>')).toBeNull()
+    expect(
+      postBodyFromPageHtml(
+        '<div class="patreon-post-content"></div><div class="Comments"><div class="RichText-module__a__root"><p>comment</p></div></div>',
+      ),
+    ).toBeNull()
+    expect(
+      postBodyFromPageHtml('<div data-tag="post-content"><div class="RichText-module__a__root"><p>Body</p></div></div>'),
+    ).toBe("<p>Body</p>")
+  })
 })
 
 describe("collection page parsing", () => {
@@ -62,6 +76,34 @@ describe("collection page parsing", () => {
       '<a href="https://www.patreon.com/posts/100?collection=8">other collection</a>' +
       '<a href="https://www.patreon.com/posts/50">no collection</a>'
     expect(postIdsFromCollectionHtml(html, "9")).toEqual(["300", "200"])
+  })
+
+  it("reads the collection id from drifted paths", () => {
+    expect(collectionIdFromPath("/collection/my-book-552396")).toBe("552396")
+    expect(collectionIdFromPath("/cw/Writer/collection/552396")).toBe("552396")
+    expect(collectionIdFromPath("/collection/552396-my-book")).toBe("552396")
+    expect(collectionIdFromPath("/collection/552396/posts")).toBe("552396")
+    expect(collectionIdFromPath("/collection/abc")).toBeNull()
+    expect(collectionIdFromPath("/collections")).toBeNull()
+  })
+
+  it("postIdOf ignores the query and requires Patreon", () => {
+    expect(postIdOf("https://www.patreon.com/posts/chapter-476-12345")).toBe("12345")
+    expect(postIdOf("/posts/chapter-476-12345?utm_source=x")).toBe("12345")
+    expect(postIdOf("https://patreon.com/posts/9")).toBe("9")
+    expect(postIdOf("https://evil.example/posts/9")).toBeNull()
+  })
+
+  it("reads a localized post count", () => {
+    expect(parseCollectionDocTitle("Buch | Collection from Writer | 178 Beiträge | Patreon").postCount).toBe(178)
+    expect(parseCollectionDocTitle("Libro | Collection from W | 1.234 publicaciones | Patreon").postCount).toBe(1234)
+    expect(parseCollectionDocTitle("300 Spartans | Patreon").postCount).toBeUndefined()
+  })
+
+  it("accepts covers only from Patreon hosts", () => {
+    expect(acceptCoverUrl("https://c10.patreonusercontent.com/a.jpg")).toBe(true)
+    expect(acceptCoverUrl("https://www.patreon.com/a.jpg")).toBe(true)
+    expect(acceptCoverUrl("https://evil.example/a.jpg")).toBe(false)
   })
 
   it("matches post links by id and collection", () => {
