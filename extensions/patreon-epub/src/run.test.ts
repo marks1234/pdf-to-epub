@@ -1,9 +1,9 @@
 import { describe, it, expect, vi } from "vitest"
 
-import { HttpError, NotJsonError, type Http } from "./http"
+import { createHttp, HttpError, NotJsonError, type Http } from "./http"
 import type { PostRef } from "./patreon-api"
 import type { FailureKind, PostResult } from "./posts"
-import { fetchAll, orderResults, probeSession, type RunDeps } from "./run"
+import { createPool, fetchAll, orderResults, probeSession, type RunDeps } from "./run"
 
 const refs = (n: number): PostRef[] => Array.from({ length: n }, (_, i) => ({ id: String(i + 1), title: `Chapter ${i + 1}` }))
 const ok = (id: string, publishedAt?: string): PostResult => ({ ok: true, id, title: `Chapter ${id}`, html: "<p>x</p>", publishedAt })
@@ -108,6 +108,121 @@ describe("fetchAll", () => {
     }, { signal: abort.signal })
     await expect(fetchAll(refs(5), d)).rejects.toMatchObject({ name: "AbortError" })
     expect(fetchPost).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe("fetchAll with the adaptive pool", () => {
+  /** A fetch whose completion the test controls. */
+  function controlled() {
+    const pending = new Map<string, (r: PostResult) => void>()
+    let inFlight = 0
+    let maxInFlight = 0
+    const started: string[] = []
+    const fetchPost = vi.fn(
+      (ref: PostRef) =>
+        new Promise<PostResult>((resolve) => {
+          started.push(ref.id)
+          inFlight++
+          maxInFlight = Math.max(maxInFlight, inFlight)
+          pending.set(ref.id, (r) => {
+            inFlight--
+            pending.delete(ref.id)
+            resolve(r)
+          })
+        }),
+    )
+    const tick = () => new Promise((r) => setTimeout(r, 0))
+    return { pending, fetchPost, started, tick, max: () => maxInFlight }
+  }
+
+  it("keeps collection order under out-of-order completion, counts completions, never exceeds 3", async () => {
+    const c = controlled()
+    const progress: number[] = []
+    const run = fetchAll(refs(6), {
+      ...deps(() => ok("x")).d,
+      fetchPost: c.fetchPost,
+      pool: createPool(3),
+      onProgress: (done) => progress.push(done),
+    })
+    await c.tick()
+    expect(c.started).toEqual(["1", "2", "3"])
+    // Finish 3, then 1, then 2 — out of order.
+    for (const id of ["3", "1", "2", "5", "4", "6"]) {
+      while (!c.pending.has(id)) await c.tick()
+      c.pending.get(id)!(ok(id))
+      await c.tick()
+    }
+    const out = await run
+    expect(out.results.map((r) => r.id)).toEqual(["1", "2", "3", "4", "5", "6"])
+    expect(progress).toEqual([1, 2, 3, 4, 5, 6])
+    expect(c.max()).toBe(3)
+  })
+
+  it("drops to one in flight on a rate limit and creeps back after 20 successes", async () => {
+    const c = controlled()
+    const pool = createPool(3)
+    const run = fetchAll(refs(30), { ...deps(() => ok("x")).d, fetchPost: c.fetchPost, pool })
+    await c.tick()
+    pool.rateLimited() // what the HTTP layer's onWait does on a 429
+    expect(pool.limit).toBe(1)
+    let maxAfter = 0
+    for (let n = 0; n < 30; n++) {
+      while (c.pending.size === 0) await c.tick()
+      const [id] = [...c.pending.keys()].sort((a, b) => Number(a) - Number(b))
+      c.pending.get(id)!(ok(id))
+      await c.tick()
+      // Before 20 successes since the limit dropped, at most one new request starts at a time.
+      if (n >= 3 && n < 19) maxAfter = Math.max(maxAfter, c.pending.size)
+    }
+    await run
+    expect(maxAfter).toBe(1)
+    expect(pool.limit).toBe(2)
+  })
+
+  it("a transient result drops the pool to one", async () => {
+    const pool = createPool(3)
+    const { d } = deps((id) => (id === "1" ? bad(id, "transient") : ok(id)), { pool })
+    await fetchAll(refs(4), d)
+    expect(pool.limit).toBe(1)
+  })
+
+  it("cancel stops new starts", async () => {
+    const c = controlled()
+    const abort = new AbortController()
+    const run = fetchAll(refs(10), { ...deps(() => ok("x")).d, fetchPost: c.fetchPost, pool: createPool(3), signal: abort.signal })
+    await c.tick()
+    abort.abort()
+    for (const resolve of [...c.pending.values()]) resolve(ok("x"))
+    await expect(run).rejects.toMatchObject({ name: "AbortError" })
+    expect(c.started).toHaveLength(3)
+  })
+})
+
+describe("http concurrency", () => {
+  it("allows up to N requests in flight and spaces their starts", async () => {
+    let inFlight = 0
+    let max = 0
+    const waits: number[] = []
+    const http = createHttp({
+      concurrency: 3,
+      minDelayMs: 250,
+      maxDelayMs: 250,
+      random: () => 0,
+      now: () => 1000,
+      sleep: async (ms) => {
+        waits.push(ms)
+      },
+      fetchImpl: (async () => {
+        inFlight++
+        max = Math.max(max, inFlight)
+        await new Promise((r) => setTimeout(r, 5))
+        inFlight--
+        return new Response("{}", { headers: { "content-type": "application/json" } })
+      }) as unknown as typeof fetch,
+    })
+    await Promise.all(Array.from({ length: 6 }, (_, i) => http.getJson(`https://www.patreon.com/api/${i}`)))
+    expect(max).toBe(3)
+    expect(waits.filter((w) => w === 250)).toHaveLength(5)
   })
 })
 

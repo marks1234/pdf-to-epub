@@ -176,9 +176,14 @@ async function start(from: number, to: number): Promise<void> {
   st.abort = abort
   const stale = () => void (st.abort === abort && showReady(st, p))
   addEventListener("beforeunload", onBeforeUnload)
-  const pool = createPool(1, 1)
+  // Up to 3 posts in flight, request starts at least ~250 ms apart; one 429/503
+  // drops the pool to 1, and 20 successes in a row win a slot back.
+  const pool = createPool(3)
   const http = createHttp({
     signal: abort.signal,
+    concurrency: pool.max,
+    minDelayMs: 250,
+    maxDelayMs: 350,
     onWait: (ms) => {
       pool.rateLimited()
       p.setPause(`Patreon asked us to slow down — resuming in ${fmtWait(ms)}`)

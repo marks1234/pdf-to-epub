@@ -90,6 +90,8 @@ export interface HttpOptions {
   onAttempt?(info: AttemptInfo): void
   /** Every parsed JSON body, for diagnostics (shape fingerprints). */
   onJson?(url: string, value: unknown): void
+  /** Requests allowed in flight at once (default 1: strictly sequential). */
+  concurrency?: number
 }
 
 export interface Http {
@@ -153,14 +155,30 @@ export function createHttp(options: HttpOptions = {}): Http & { readonly slow: n
     onWait,
     onAttempt,
     onJson,
+    concurrency = 1,
   } = options
   let lastRequestAt = 0
   /** No Patreon request starts before this (set by 429 / 503 + Retry-After). */
   let cooldownUntil = 0
   /** Multiplier on the gap; doubles on a rate limit, decays on success. */
   let slow = 1
-  // Requests are chained so callers can't accidentally run them in parallel.
-  let queue: Promise<unknown> = Promise.resolve()
+  // At most `concurrency` requests in flight (1 = strictly sequential).
+  let active = 0
+  const waiters: (() => void)[] = []
+  // Request starts pass through one gate, so the gap and cooldown hold across
+  // concurrent requests too.
+  let gate: Promise<void> = Promise.resolve()
+
+  function reserveStart(patreon: boolean): Promise<void> {
+    const turn = gate.then(async () => {
+      const gap = (minDelayMs + random() * (maxDelayMs - minDelayMs)) * (patreon ? slow : 1)
+      const waitFor = Math.max(lastRequestAt ? lastRequestAt + gap : 0, patreon ? cooldownUntil : 0) - now()
+      if (waitFor > 0) await wait(waitFor, signal)
+      lastRequestAt = now()
+    })
+    gate = turn.catch(() => undefined)
+    return turn
+  }
 
   const backoff = (n: number) => backoffMs * 2 ** n * (1 + random() * 0.25)
 
@@ -177,10 +195,8 @@ export function createHttp(options: HttpOptions = {}): Http & { readonly slow: n
     let rateWaited = 0
     for (let tryNo = 0; ; ) {
       if (signal?.aborted) throw abortError()
-      const gap = (minDelayMs + random() * (maxDelayMs - minDelayMs)) * (patreon ? slow : 1)
-      const waitFor = Math.max(lastRequestAt ? lastRequestAt + gap : 0, patreon ? cooldownUntil : 0) - now()
-      if (waitFor > 0) await wait(waitFor, signal)
-      lastRequestAt = now()
+      await reserveStart(patreon)
+      const startedAt = now()
 
       const ts = AbortSignal.timeout(perTryMs)
       const s = signal ? AbortSignal.any([signal, ts]) : ts
@@ -190,7 +206,7 @@ export function createHttp(options: HttpOptions = {}): Http & { readonly slow: n
         onAttempt?.({
           url,
           tryNo,
-          ms: now() - lastRequestAt,
+          ms: now() - startedAt,
           status: res?.status,
           contentType: res?.headers.get("content-type") ?? null,
           redirected: res?.redirected,
@@ -258,10 +274,16 @@ export function createHttp(options: HttpOptions = {}): Http & { readonly slow: n
     }
   }
 
-  function enqueue<T>(job: () => Promise<T>): Promise<T> {
-    const run = queue.then(job, job)
-    queue = run.catch(() => undefined)
-    return run
+  async function enqueue<T>(job: () => Promise<T>): Promise<T> {
+    if (active < concurrency) active++
+    else await new Promise<void>((resolve) => waiters.push(resolve)) // the slot is handed over
+    try {
+      return await job()
+    } finally {
+      const next = waiters.shift()
+      if (next) next()
+      else active--
+    }
   }
 
   const readJson = (url: string) => async (r: Response): Promise<unknown> => {
