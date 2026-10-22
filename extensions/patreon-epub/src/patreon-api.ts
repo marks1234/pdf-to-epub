@@ -9,6 +9,7 @@
 import type { Block } from "@/lib/reconstruct"
 import { extractNumber } from "@/lib/sequence"
 
+import { HttpError, isAbort, NotJsonError } from "./http"
 import { prosemirrorJsonToBlocks } from "./prosemirror-to-blocks"
 
 export const ORIGIN = "https://www.patreon.com"
@@ -27,6 +28,8 @@ export interface ListPage {
   posts: PostRef[]
   /** Absolute URL of the next page, or null on the last page. */
   next: string | null
+  /** A next link/cursor was present but could not be followed safely. */
+  nextRejected?: boolean
 }
 
 export interface CollectionInfo {
@@ -55,11 +58,14 @@ export interface PostContent {
 
 // ── URLs ─────────────────────────────────────────────────────────────────────
 
-export function postsListUrl(collectionId: string, withSort: boolean): string {
+const LIST_FIELDS = "title,published_at,url,current_user_can_view"
+
+export function postsListUrl(collectionId: string, withSort: boolean, pageSize?: number): string {
   const q = new URLSearchParams()
   q.set("filter[collection_id]", collectionId)
   if (withSort) q.set("sort", "collection_order")
-  q.set("fields[post]", "title,published_at,url")
+  if (pageSize) q.set("page[count]", String(pageSize))
+  q.set("fields[post]", LIST_FIELDS)
   q.set("json-api-version", "1.0")
   return `${ORIGIN}/api/posts?${q}`
 }
@@ -67,7 +73,7 @@ export function postsListUrl(collectionId: string, withSort: boolean): string {
 export function collectionUrl(collectionId: string): string {
   const q = new URLSearchParams()
   q.set("include", "posts,campaign")
-  q.set("fields[post]", "title,published_at,url")
+  q.set("fields[post]", LIST_FIELDS)
   q.set("json-api-version", "1.0")
   return `${ORIGIN}/api/collection/${collectionId}?${q}`
 }
@@ -99,25 +105,32 @@ export class ApiShapeError extends Error {
   }
 }
 
+/** A listing that can't be this collection (filter ignored) or was cut short. */
+export class ImplausibleListing extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "ImplausibleListing"
+  }
+}
+
 function postRefFrom(resource: Json): PostRef | null {
   const id = idOf(resource.id)
   if (!id) return null
   const a = isObj(resource.attributes) ? resource.attributes : {}
-  return {
-    id,
-    title: str(a.title),
-    publishedAt: str(a.published_at),
-    url: str(a.url),
-  }
+  const ref: PostRef = { id, title: str(a.title), publishedAt: str(a.published_at), url: str(a.url) }
+  if (typeof a.current_user_can_view === "boolean") ref.canView = a.current_user_can_view
+  return ref
 }
 
 /**
- * Resolve a pagination link against the site origin. Only same-origin links are
- * followed — a response can never send the content script elsewhere.
+ * Resolve a pagination link against the site origin. Only Patreon links are
+ * followed (`patreon.com` is rewritten to `www.patreon.com`) — a response can
+ * never send the content script elsewhere.
  */
 export function resolveSameOrigin(link: string, base = ORIGIN): string | null {
   try {
     const u = new URL(link, base)
+    if (u.protocol === "https:" && u.hostname === "patreon.com") u.hostname = "www.patreon.com"
     return u.origin === ORIGIN ? u.toString() : null
   } catch {
     return null
@@ -125,9 +138,10 @@ export function resolveSameOrigin(link: string, base = ORIGIN): string | null {
 }
 
 /**
- * One page of `/api/posts`. The next page comes from `links.next`; if that is
- * missing but a cursor is (`meta.pagination.cursors.next`), it is applied to
- * the current URL as `page[cursor]`.
+ * One page of `/api/posts`. The next page comes from `links.next` (a string or
+ * `{href}`), or from a cursor (`links.next.cursor`, `meta.pagination.cursors.next`,
+ * `meta.pagination.next`, `meta.next_cursor`) applied to the current URL as
+ * `page[cursor]`.
  */
 export function parsePostListPage(json: unknown, currentUrl: string): ListPage {
   if (!isObj(json) || !Array.isArray(json.data)) throw new ApiShapeError("Listing response has no data array.")
@@ -137,23 +151,33 @@ export function parsePostListPage(json: unknown, currentUrl: string): ListPage {
     .map(postRefFrom)
     .filter((p): p is PostRef => p !== null)
 
-  let next: string | null = null
   const links = isObj(json.links) ? json.links : {}
-  if (typeof links.next === "string" && links.next) {
-    next = resolveSameOrigin(links.next, currentUrl)
-  } else {
-    const meta = isObj(json.meta) ? json.meta : {}
-    const pagination = isObj(meta.pagination) ? meta.pagination : {}
-    const cursors = isObj(pagination.cursors) ? pagination.cursors : {}
-    const cursor = str(cursors.next)
-    if (cursor) {
-      const u = new URL(currentUrl)
-      u.searchParams.set("page[cursor]", cursor)
-      next = resolveSameOrigin(u.toString())
-    }
+  const meta = isObj(json.meta) ? json.meta : {}
+  const pagination = isObj(meta.pagination) ? meta.pagination : {}
+  const cursors = isObj(pagination.cursors) ? pagination.cursors : {}
+  const looksLikeLink = (s: string | undefined) => !!s && /^(https?:)?\/|^\?/.test(s)
+
+  let link = typeof links.next === "string" ? str(links.next) : isObj(links.next) ? str(links.next.href) : undefined
+  let cursor = isObj(links.next) ? str(links.next.cursor) : undefined
+  if (!link && !cursor) {
+    const c = str(cursors.next) ?? str(pagination.next) ?? str(meta.next_cursor)
+    if (looksLikeLink(c)) link = c
+    else cursor = c
+  }
+
+  let next: string | null = null
+  let nextRejected = false
+  if (link) {
+    next = resolveSameOrigin(link, currentUrl)
+    nextRejected = next === null
+  } else if (cursor) {
+    const u = new URL(currentUrl)
+    u.searchParams.set("page[cursor]", cursor)
+    next = resolveSameOrigin(u.toString())
+    nextRejected = next === null
   }
   if (next === currentUrl) next = null
-  return { posts, next }
+  return nextRejected ? { posts, next, nextRejected } : { posts, next }
 }
 
 /** `/api/collection/{id}`: title, ordered post IDs, included posts, cover. */
@@ -176,6 +200,7 @@ export function parseCollection(json: unknown): CollectionInfo {
     .filter((p): p is PostRef => p !== null)
   const byId = new Map(includedPosts.map((p) => [p.id, p]))
   if (postIds.length === 0) postIds = includedPosts.map((p) => p.id)
+  postIds = [...new Set(postIds)]
   const posts = postIds.map((id) => byId.get(id) ?? { id })
 
   const thumb = isObj(a.thumbnail) ? a.thumbnail : {}
@@ -227,23 +252,33 @@ export interface Listing {
   posts: PostRef[]
   order: ListingOrder
   /** Which strategy produced it, for the UI and for debugging. */
-  source: "posts-api" | "posts-api-unsorted" | "collection-api" | "page"
+  source: "posts-api" | "posts-api-unsorted" | "collection-api" | "page" | "page-untagged"
   /** Collection metadata, when the collection endpoint answered. */
   collection?: CollectionInfo
+  /** Set when the best listing is shorter than expected or was cut short. */
+  incomplete?: { found: number; expected?: number }
+  /** What went wrong along the way (strategy errors), for the UI and diagnostics. */
+  notes?: string[]
+  /** The crawl stopped with a next link it couldn't follow. */
+  truncated?: boolean
 }
 
 export interface ListingDeps {
   fetchJson(url: string): Promise<unknown>
   /** Post IDs harvested from the collection page itself, newest first. */
-  harvestPage(): Promise<string[]>
+  harvestPage(expected?: number): Promise<string[] | { ids: string[]; source: "page" | "page-untagged" }>
   /** IDs already visible on the page; a listing must overlap them to be trusted. */
   visibleIds: string[]
   /** Expected post count (from the page title), if known. */
   expectedCount?: number
   /** Called as each strategy starts, for progress messages. */
   onStep?(message: string): void
+  /** Diagnostics. */
+  log?(line: string): void
   /** Safety cap on pages followed. */
   maxPages?: number
+  /** First-page size to ask for. */
+  pageSize?: number
 }
 
 /**
@@ -258,17 +293,61 @@ export function plausibleListing(posts: PostRef[], visibleIds: string[], expecte
     const ids = new Set(posts.map((p) => p.id))
     if (!visibleIds.some((id) => ids.has(id))) return false
   }
-  if (expectedCount && posts.length > expectedCount + Math.max(5, expectedCount * 0.1)) return false
+  if (expectedCount && tooMany(posts.length, expectedCount)) return false
   return true
 }
 
-async function listViaPostsApi(collectionId: string, withSort: boolean, deps: ListingDeps): Promise<PostRef[]> {
+const tooMany = (n: number, expected: number) => n > expected + Math.max(5, expected * 0.1)
+
+/** HTTP status of an error, from HttpError or an "HTTP 400" message. */
+function statusOf(e: unknown): number | undefined {
+  if (e instanceof HttpError) return e.status
+  const m = /\bHTTP (\d{3})\b/.exec(errText(e))
+  return m ? Number(m[1]) : undefined
+}
+
+function isTransientError(e: unknown): boolean {
+  const s = statusOf(e)
+  if (s !== undefined) return s === 408 || s === 429 || s >= 500
+  return !(e instanceof ApiShapeError || e instanceof ImplausibleListing || e instanceof NotJsonError || isAbort(e))
+}
+
+async function listViaPostsApi(
+  collectionId: string,
+  withSort: boolean,
+  deps: ListingDeps,
+  expected: number | undefined,
+): Promise<{ posts: PostRef[]; truncated: boolean }> {
+  const maxPages = deps.maxPages ?? (expected ? Math.ceil((expected * 1.1) / 10) + 3 : 60)
+  let pageSize = deps.pageSize ?? 100
   const posts: PostRef[] = []
   const seen = new Set<string>()
-  let url: string | null = postsListUrl(collectionId, withSort)
-  const maxPages = deps.maxPages ?? 200
-  for (let page = 0; url && page < maxPages; page++) {
-    const parsed = parsePostListPage(await deps.fetchJson(url), url)
+  let url: string | null = postsListUrl(collectionId, withSort, pageSize || undefined)
+  let retriedTransient = false
+  let truncated = false
+  let page = 0
+  while (url) {
+    if (page >= maxPages) throw new ImplausibleListing(`still more pages after ${maxPages}`)
+    let parsed: ListPage
+    try {
+      parsed = parsePostListPage(await deps.fetchJson(url), url)
+    } catch (e) {
+      if (isAbort(e)) throw e
+      const s = statusOf(e)
+      if (page === 0 && pageSize && (s === 400 || s === 422)) {
+        deps.log?.(`posts api: page[count] rejected (${s}), retrying without it`)
+        pageSize = 0
+        url = postsListUrl(collectionId, withSort)
+        continue
+      }
+      if (!retriedTransient && isTransientError(e)) {
+        retriedTransient = true
+        deps.log?.(`posts api: transient error on page ${page} (${errText(e)}), retrying once`)
+        continue
+      }
+      throw e
+    }
+    page++
     let fresh = 0
     for (const p of parsed.posts) {
       if (seen.has(p.id)) continue
@@ -276,63 +355,99 @@ async function listViaPostsApi(collectionId: string, withSort: boolean, deps: Li
       posts.push(p)
       fresh++
     }
+    if (expected && tooMany(posts.length, expected)) throw new ImplausibleListing(`${posts.length}+ posts, expected ${expected}`)
+    if (parsed.nextRejected) truncated = true
     // A page with nothing new means the cursor isn't advancing — stop.
     if (fresh === 0) break
     url = parsed.next
   }
-  return posts
+  return { posts, truncated }
 }
 
 /**
- * List the collection's posts, trying in order: the posts API filtered by
- * collection and sorted by collection order; the same without the sort; the
- * collection endpoint; and finally harvesting links from the page itself.
- * Collection metadata is fetched alongside when possible (title, cover).
+ * List the collection's posts. The collection endpoint is asked first (one
+ * request; its metadata names the book). If it is complete, it wins outright.
+ * Otherwise the posts API (sorted, then unsorted only if the sort was
+ * rejected), then the page itself. A short listing never wins silently: the
+ * longest candidate is returned with `incomplete` set.
  */
 export async function listCollection(collectionId: string, deps: ListingDeps): Promise<Listing> {
   const errors: string[] = []
+  const log = (line: string) => deps.log?.(`listing: ${line}`)
+  deps.onStep?.("Listing chapters…")
+
   let collection: CollectionInfo | undefined
-
-  const tryCollection = async (): Promise<CollectionInfo | undefined> => {
-    try {
-      return parseCollection(await deps.fetchJson(collectionUrl(collectionId)))
-    } catch (e) {
-      errors.push(`collection: ${errText(e)}`)
-      return undefined
-    }
+  try {
+    collection = parseCollection(await deps.fetchJson(collectionUrl(collectionId)))
+    log(`collection: ${collection.postIds.length} ids, num_posts=${collection.postCount ?? "?"}`)
+  } catch (e) {
+    if (isAbort(e)) throw e
+    errors.push(`collection: ${errText(e)}`)
+    log(`collection failed: ${errText(e)}`)
+  }
+  const expected = deps.expectedCount ?? collection?.postCount
+  const isComplete = (l: Listing) => !l.truncated && (!expected || l.posts.length >= Math.floor(expected * 0.9))
+  const candidates: Listing[] = []
+  const finish = (l: Listing): Listing => {
+    const out: Listing = { ...l, collection }
+    if (!isComplete(l)) out.incomplete = { found: l.posts.length, expected }
+    if (errors.length) out.notes = errors
+    log(`chose ${l.source} (${l.order}): ${l.posts.length}/${expected ?? "?"}, visible=${deps.visibleIds.length}${l.truncated ? ", truncated" : ""}`)
+    return out
   }
 
-  for (const withSort of [true, false]) {
-    deps.onStep?.(withSort ? "Listing chapters…" : "Listing chapters (retrying without sort)…")
-    try {
-      const posts = await listViaPostsApi(collectionId, withSort, deps)
-      if (plausibleListing(posts, deps.visibleIds, deps.expectedCount)) {
-        collection = await tryCollection()
-        return {
-          posts,
-          order: withSort ? "collection" : "unordered",
-          source: withSort ? "posts-api" : "posts-api-unsorted",
-          collection,
+  if (collection && plausibleListing(collection.posts, deps.visibleIds, expected)) {
+    const c: Listing = { posts: collection.posts, order: "collection", source: "collection-api" }
+    if (expected && collection.posts.length === expected && collection.posts.every((p) => p.title)) return finish(c)
+    candidates.push(c)
+  }
+
+  const validators = deps.visibleIds.length > 0 || !!expected || (collection?.postIds.length ?? 0) > 0
+  if (!validators) {
+    errors.push("posts api: skipped (nothing on the page to check a listing against)")
+  } else {
+    for (const withSort of [true, false]) {
+      const name = `posts api${withSort ? "" : " (unsorted)"}`
+      if (!withSort) deps.onStep?.("Listing chapters (retrying without sort)…")
+      try {
+        const { posts, truncated } = await listViaPostsApi(collectionId, withSort, deps, expected)
+        if (plausibleListing(posts, deps.visibleIds, expected)) {
+          const l: Listing = { posts, order: withSort ? "collection" : "unordered", source: withSort ? "posts-api" : "posts-api-unsorted" }
+          if (truncated) l.truncated = true
+          log(`${name}: ${posts.length} posts${truncated ? " (truncated)" : ""}`)
+          if (isComplete(l)) return finish(l)
+          candidates.push(l)
+        } else {
+          errors.push(`${name}: implausible listing (${posts.length} posts)`)
+          log(`${name}: implausible (${posts.length})`)
         }
+        break
+      } catch (e) {
+        if (isAbort(e)) throw e
+        errors.push(`${name}: ${errText(e)}`)
+        log(`${name} failed: ${errText(e)}`)
+        const s = statusOf(e)
+        // Only a rejected sort is worth an unsorted pass; anything else would repeat.
+        if (!(withSort && (s === 400 || s === 404 || s === 422))) break
       }
-      errors.push(`posts api${withSort ? "" : " (unsorted)"}: implausible listing (${posts.length} posts)`)
-    } catch (e) {
-      errors.push(`posts api${withSort ? "" : " (unsorted)"}: ${errText(e)}`)
     }
   }
 
-  deps.onStep?.("Listing chapters via the collection endpoint…")
-  collection = await tryCollection()
-  if (collection && plausibleListing(collection.posts, deps.visibleIds, deps.expectedCount)) {
-    return { posts: collection.posts, order: "collection", source: "collection-api", collection }
-  }
+  const longest = () => candidates.reduce<Listing | undefined>((a, b) => (!a || b.posts.length > a.posts.length ? b : a), undefined)
+  const completeOne = candidates.find(isComplete)
+  if (completeOne) return finish(completeOne)
 
   deps.onStep?.("Reading chapter links from the page (clicking “Load more”)…")
-  const ids = await deps.harvestPage()
+  const harvested = await deps.harvestPage(expected)
+  const { ids, source } = Array.isArray(harvested) ? { ids: harvested, source: "page" as const } : harvested
+  log(`${source}: ${ids.length} ids`)
   if (ids.length > 0) {
-    return { posts: ids.map((id) => ({ id })), order: "newest-first", source: "page", collection }
+    if (source === "page-untagged") errors.push("page: post links weren't tagged with this collection; the list may include unrelated posts")
+    candidates.push({ posts: ids.map((id) => ({ id })), order: "newest-first", source })
   }
-  throw new Error(`Couldn't list this collection's posts. ${errors.join("; ")}`)
+  const best = longest()
+  if (!best) throw new Error(`Couldn't list this collection's posts. ${errors.join("; ")}`)
+  return finish(best)
 }
 
 function errText(e: unknown): string {

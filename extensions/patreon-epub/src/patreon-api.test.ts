@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest"
 
+import { HttpError } from "./http"
 import {
   cleanChapterTitle,
   listCollection,
@@ -84,7 +85,7 @@ describe("parseCollection / parsePost", () => {
 
 describe("listCollection", () => {
   const pages: Record<string, unknown> = {}
-  const p1 = postsListUrl("9", true)
+  const p1 = postsListUrl("9", true, 100)
   const p2 = "https://www.patreon.com/api/posts?cursor=2"
   pages[p1] = { data: [post("1", "Chapter 1", "2026-01-01"), post("2", "Chapter 2", "2026-01-02")], links: { next: p2 } }
   pages[p2] = { data: [post("3", "Chapter 3", "2026-01-03")], links: {} }
@@ -111,13 +112,13 @@ describe("listCollection", () => {
   })
 
   it("stops when a page repeats (cursor not advancing)", async () => {
-    const loop = postsListUrl("9", true)
+    const loop = postsListUrl("9", true, 100)
     const d = deps({
       fetchJson: async (url: string) =>
         url === loop ? { data: [post("1", "Chapter 1", "2026-01-01")], links: { next: "https://www.patreon.com/api/posts?again" } }
         : url.includes("again") ? { data: [post("1", "Chapter 1", "2026-01-01")], links: { next: "https://www.patreon.com/api/posts?again" } }
         : { data: { id: "9", attributes: {} } },
-      visibleIds: [],
+      visibleIds: ["1"],
     })
     const listing = await listCollection("9", d)
     expect(listing.posts.map((p) => p.id)).toEqual(["1"])
@@ -171,6 +172,165 @@ describe("listCollection", () => {
       harvestPage: async () => [],
     })
     await expect(listCollection("9", d)).rejects.toThrow(/Couldn't list/)
+  })
+})
+
+describe("listCollection (bounded, complete)", () => {
+  const ids = (n: number, from = 1) => Array.from({ length: n }, (_, i) => String(from + i))
+  const collection = (postIds: string[], titled = true, numPosts?: number) => ({
+    data: { id: "9", attributes: { title: "Book", post_ids: postIds, ...(numPosts ? { num_posts: numPosts } : {}) } },
+    included: titled ? postIds.map((id) => post(id, `Chapter ${id}`, "2026-01-01")) : [],
+  })
+  const harvest = vi.fn(async () => [] as string[])
+
+  it("a complete collection never calls /api/posts", async () => {
+    const calls: string[] = []
+    const listing = await listCollection("9", {
+      fetchJson: async (url) => {
+        calls.push(url)
+        return collection(ids(3), true, 3)
+      },
+      harvestPage: harvest,
+      visibleIds: ["3"],
+    })
+    expect(listing.source).toBe("collection-api")
+    expect(calls).toHaveLength(1)
+    expect(listing.incomplete).toBeUndefined()
+  })
+
+  it("dedupes post_ids", () => {
+    expect(parseCollection(collection(["1", "2", "1"])).postIds).toEqual(["1", "2"])
+  })
+
+  it("an endless feed that ignores the filter stops early, with no unsorted crawl", async () => {
+    const calls: string[] = []
+    let n = 0
+    await expect(
+      listCollection("9", {
+        fetchJson: async (url) => {
+          calls.push(url)
+          if (url.includes("/api/collection/")) throw new Error("HTTP 500")
+          n += 20
+          return { data: ids(20, n).map((id) => post(id, "x", "2026-01-01")), links: { next: `https://www.patreon.com/api/posts?c=${n}` } }
+        },
+        harvestPage: harvest,
+        visibleIds: [],
+        expectedCount: 178,
+      }),
+    ).rejects.toThrow(/Couldn't list/)
+    expect(calls.length).toBeLessThanOrEqual(22)
+    expect(calls[0]).toContain("/api/collection/")
+    expect(calls.some((u) => u.includes("filter%5Bcollection_id%5D") && !u.includes("sort="))).toBe(false)
+  })
+
+  it("a 178-post sorted listing succeeds when only the newest 20 are visible", async () => {
+    const all = ids(178)
+    const listing = await listCollection("9", {
+      fetchJson: async (url) => {
+        if (url.includes("/api/collection/")) return { data: { id: "9", attributes: {} } }
+        const page = Number(new URL(url).searchParams.get("page[cursor]") ?? 0)
+        const slice = all.slice(page * 100, page * 100 + 100)
+        return { data: slice.map((id) => post(id, `C ${id}`, "2026-01-01")), links: page === 0 ? { next: { href: "/api/posts?page%5Bcursor%5D=1" } } : {} }
+      },
+      harvestPage: harvest,
+      visibleIds: all.slice(-20).reverse(),
+      expectedCount: 178,
+    })
+    expect(listing.source).toBe("posts-api")
+    expect(listing.posts).toHaveLength(178)
+  })
+
+  it("a 400 on page[count] retries still sorted; a 400 on sort retries unsorted", async () => {
+    const calls: string[] = []
+    const listing = await listCollection("9", {
+      fetchJson: async (url) => {
+        calls.push(url)
+        if (url.includes("/api/collection/")) return { data: { id: "9", attributes: {} } }
+        if (url.includes("page%5Bcount%5D") || url.includes("sort=")) throw new HttpError(400, url)
+        return { data: [post("3", "C3", "2026-01-03")] }
+      },
+      harvestPage: harvest,
+      visibleIds: ["3"],
+    })
+    expect(listing.source).toBe("posts-api-unsorted")
+    expect(calls[1]).toContain("page%5Bcount%5D=100")
+    expect(calls[2]).toContain("sort=")
+    expect(calls[2]).not.toContain("page%5Bcount%5D")
+  })
+
+  it("short posts listing + full collection: the longer one wins", async () => {
+    const listing = await listCollection("9", {
+      fetchJson: async (url) => {
+        if (url.includes("/api/collection/")) return collection(ids(10), false)
+        return { data: ids(4).map((id) => post(id, `C${id}`, "2026-01-01")) }
+      },
+      harvestPage: harvest,
+      visibleIds: ["1"],
+      expectedCount: 10,
+    })
+    expect(listing.source).toBe("collection-api")
+    expect(listing.posts).toHaveLength(10)
+  })
+
+  it("all strategies short: incomplete is set", async () => {
+    const listing = await listCollection("9", {
+      fetchJson: async (url) => {
+        if (url.includes("/api/collection/")) throw new Error("HTTP 500")
+        return { data: ids(4).map((id) => post(id, `C${id}`, "2026-01-01")) }
+      },
+      harvestPage: async () => ["2", "1"],
+      visibleIds: ["1"],
+      expectedCount: 10,
+    })
+    expect(listing.incomplete).toEqual({ found: 4, expected: 10 })
+    expect(listing.notes?.length).toBeGreaterThan(0)
+  })
+
+  it("no validators at all: falls through to the harvest", async () => {
+    const calls: string[] = []
+    const listing = await listCollection("9", {
+      fetchJson: async (url) => {
+        calls.push(url)
+        if (url.includes("/api/collection/")) return { data: { id: "9", attributes: {} } }
+        return { data: [post("70", "x", "2026-01-01")] }
+      },
+      harvestPage: async () => ["5", "4"],
+      visibleIds: [],
+    })
+    expect(listing.source).toBe("page")
+    expect(calls).toHaveLength(1)
+  })
+})
+
+describe("pagination drift", () => {
+  const cur = postsListUrl("9", true)
+  it("follows a non-www patreon link and {href}; rejects other hosts", () => {
+    expect(parsePostListPage({ data: [], links: { next: "https://patreon.com/api/posts?c=2" } }, cur).next).toBe(
+      "https://www.patreon.com/api/posts?c=2",
+    )
+    expect(parsePostListPage({ data: [], links: { next: { href: "/api/posts?c=3" } } }, cur).next).toBe(
+      "https://www.patreon.com/api/posts?c=3",
+    )
+    const bad = parsePostListPage({ data: [], links: { next: "https://evil.example/x" } }, cur)
+    expect(bad).toMatchObject({ next: null, nextRejected: true })
+  })
+  it("reads cursors from meta.next_cursor and links.next.cursor", () => {
+    const a = parsePostListPage({ data: [], meta: { next_cursor: "k1" } }, cur).next as string
+    expect(new URL(a).searchParams.get("page[cursor]")).toBe("k1")
+    const b = parsePostListPage({ data: [], links: { next: { cursor: "k2" } } }, cur).next as string
+    expect(new URL(b).searchParams.get("page[cursor]")).toBe("k2")
+  })
+  it("a rejected next link marks the listing truncated (and incomplete)", async () => {
+    const listing = await listCollection("9", {
+      fetchJson: async (url) => {
+        if (url.includes("/api/collection/")) throw new Error("HTTP 500")
+        return { data: [post("1", "C1", "2026-01-01")], links: { next: "https://evil.example/x" } }
+      },
+      harvestPage: async () => [],
+      visibleIds: ["1"],
+    })
+    expect(listing.truncated).toBe(true)
+    expect(listing.incomplete).toBeDefined()
   })
 })
 
