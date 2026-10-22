@@ -6,7 +6,10 @@
  * calls the site makes for a logged-in patron — so they only ever return what
  * the user's account can already read.
  */
+import type { Block } from "@/lib/reconstruct"
 import { extractNumber } from "@/lib/sequence"
+
+import { prosemirrorJsonToBlocks } from "./prosemirror-to-blocks"
 
 export const ORIGIN = "https://www.patreon.com"
 
@@ -41,6 +44,8 @@ export interface PostContent {
   id: string
   title?: string
   html: string | null
+  /** From `content_json_string` when `content` is empty (Patreon's newer editor). */
+  blocks?: Block[]
   publishedAt?: string
   /** `current_user_can_view`, when the API reports it. */
   canView?: boolean
@@ -67,7 +72,7 @@ export function collectionUrl(collectionId: string): string {
 
 export function postUrl(postId: string): string {
   const q = new URLSearchParams()
-  q.set("fields[post]", "title,content,published_at,current_user_can_view")
+  q.set("fields[post]", "title,content,content_json_string,published_at,current_user_can_view")
   q.set("json-api-version", "1.0")
   return `${ORIGIN}/api/posts/${postId}?${q}`
 }
@@ -198,10 +203,14 @@ export function parsePost(json: unknown): PostContent {
   if (!id) throw new ApiShapeError("Post response has no id.")
   const a = isObj(json.data.attributes) ? json.data.attributes : {}
   const content = typeof a.content === "string" && a.content.trim() ? a.content : null
+  // Patreon now often sends `content: null` and the text only as a TipTap doc.
+  const blocks =
+    !content && typeof a.content_json_string === "string" ? prosemirrorJsonToBlocks(a.content_json_string) : null
   return {
     id,
     title: str(a.title),
     html: content,
+    ...(blocks ? { blocks } : {}),
     publishedAt: str(a.published_at),
     canView: typeof a.current_user_can_view === "boolean" ? a.current_user_can_view : undefined,
   }

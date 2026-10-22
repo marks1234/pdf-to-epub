@@ -5,6 +5,7 @@
  * content-script CSP forbids).
  */
 import type { Chapter } from "@/lib/epub-book"
+import type { Block } from "@/lib/reconstruct"
 import { createStyler, DEFAULT_STYLE_CONFIG } from "@/lib/styles"
 
 import { writeEpub, type WriterMeta } from "./epub-writer"
@@ -23,8 +24,9 @@ export interface BookRequest {
 }
 
 /** One fetched post → one chapter. Returns null when the body has no text. */
-export function postToChapter(post: { title: string; html: string }, bookTitle?: string): Chapter | null {
-  const blocks = htmlToBlocks(post.html)
+export function postToChapter(post: { title: string; html: string; blocks?: Block[] }, bookTitle?: string): Chapter | null {
+  // Non-empty HTML wins; otherwise the blocks parsed from `content_json_string`.
+  const blocks = post.html.trim() ? htmlToBlocks(post.html) : (post.blocks ?? [])
   if (blocks.every((b) => b.type === "hr")) return null
   return { title: cleanChapterTitle(post.title, bookTitle), blocks }
 }
