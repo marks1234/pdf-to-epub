@@ -10,6 +10,7 @@ import {
   parsePostListPage,
   plausibleListing,
   postsListUrl,
+  titleSortKey,
   type ListingDeps,
   type PostRef,
 } from "./patreon-api"
@@ -369,6 +370,36 @@ describe("orderOldestFirst", () => {
   })
   it("reverses a bare newest-first page listing", () => {
     expect(ids(orderOldestFirst([{ id: "3" }, { id: "2" }, { id: "1" }], "newest-first"))).toEqual(["1", "2", "3"])
+  })
+})
+
+describe("ordering robustness", () => {
+  const p = (id: string, date: string | undefined, title = `Chapter ${id}`): PostRef => ({ id, title, publishedAt: date })
+  const ids = (ps: PostRef[]) => ps.map((x) => x.id)
+  const asc = [p("1", "2025-01-01"), p("2", "2025-02-01"), p("3", "2025-03-01"), p("4", "2025-04-01")]
+
+  it("a 2026 index post in front of ascending 2025 chapters doesn't reverse the book", () => {
+    const list = [p("idx", "2026-05-01", "Index"), ...asc]
+    expect(ids(orderOldestFirst(list, "collection"))).toEqual(["idx", "1", "2", "3", "4"])
+  })
+  it("the mirror case is reversed", () => {
+    const list = [...[...asc].reverse(), p("idx", "2026-05-01", "Index")]
+    expect(ids(orderOldestFirst(list, "collection"))).toEqual(["idx", "1", "2", "3", "4"])
+  })
+  it("null dates at both ends with a descending middle are reversed", () => {
+    const list = [p("a", undefined, "Note"), ...[...asc].reverse(), p("z", undefined, "Note 2")]
+    expect(ids(orderOldestFirst(list, "collection"))).toEqual(["z", "1", "2", "3", "4", "a"])
+  })
+  it("an undated interlude stays next to its neighbour in a newest-first list", () => {
+    const list = [p("4", "2025-04-01"), p("3", "2025-03-01"), p("i", undefined, "Interlude"), p("2", "2025-02-01"), p("1", "2025-01-01")]
+    expect(ids(orderOldestFirst(list, "newest-first"))).toEqual(["1", "2", "i", "3", "4"])
+  })
+  it("title sort keys", () => {
+    const k = (t: string) => titleSortKey(t) as number
+    expect(k("Vol. 2 Ch 3")).toBeLessThan(k("Vol. 3 Ch 1"))
+    expect(k("Chapter 12")).toBeLessThan(k("12.5"))
+    expect(k("12.5")).toBeLessThan(k("13"))
+    expect(k("Ch 40 - Mr. Grey")).toBe(40)
   })
 })
 

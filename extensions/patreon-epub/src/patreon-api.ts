@@ -462,40 +462,103 @@ function dateOf(p: PostRef): number | null {
   return Number.isNaN(t) ? null : t
 }
 
+/**
+ * A sortable number for a chapter title: `Vol. 2 Ch 3` → 2e6+3, decimal
+ * chapters (`12.5`) allowed, else the app's own number extraction.
+ */
+export function titleSortKey(title: string): number | null {
+  const ch = /\b(?:ch(?:apter)?|ep(?:isode)?|part)\.?\s*#?\s*(\d+(?:\.\d+)?)/i.exec(title)
+  const vol = /\b(?:vol(?:ume)?|book)\.?\s*#?\s*(\d+)/i.exec(title)
+  if (ch) return (vol ? Number(vol[1]) * 1e6 : 0) + Number(ch[1])
+  const bare = /(?:^|[^\d.])(\d+\.\d+)(?![\d.])/.exec(title)
+  if (bare) return Number(bare[1])
+  // The ".x" keeps extractNumber from treating a trailing ".5" as an extension.
+  return extractNumber(`${title}.x`).num
+}
+
 function chapterNumberOf(p: PostRef): number | null {
-  return p.title ? extractNumber(p.title).num : null
+  return p.title ? titleSortKey(p.title) : null
+}
+
+/** Rising vs falling steps between consecutive known values. */
+function stepVote(values: (number | null)[]): { up: number; down: number } {
+  let up = 0
+  let down = 0
+  let prev: number | null = null
+  for (const v of values) {
+    if (v === null) continue
+    if (prev !== null) {
+      if (v > prev) up++
+      else if (v < prev) down++
+    }
+    prev = v
+  }
+  return { up, down }
+}
+
+/**
+ * Does a creator-ordered list run newest first? Only when falling steps
+ * outnumber rising ones by more than 2:1 — so one pinned or re-posted post
+ * can't flip the book. Dates decide; chapter numbers break a tie of too few
+ * or mixed dates. Default: keep the creator's order.
+ */
+export function looksNewestFirst(dates: (number | null)[], nums: (number | null)[]): boolean {
+  for (const vote of [stepVote(dates), stepVote(nums)]) {
+    if (vote.up + vote.down < 2) continue
+    if (vote.down > 2 * vote.up) return true
+    if (vote.up > 2 * vote.down) return false
+  }
+  return false
+}
+
+/**
+ * Sort the items that have a key; put each keyless item right after its
+ * predecessor (in `base` order) among the keyed ones.
+ */
+function sortKeepingNeighbours<T>(base: T[], key: (t: T) => number | null, tie: (a: T, b: T) => number): T[] {
+  const keyed = base.filter((t) => key(t) !== null).sort((a, b) => (key(a) as number) - (key(b) as number) || tie(a, b))
+  const after = new Map<T | null, T[]>()
+  let pred: T | null = null
+  for (const t of base) {
+    if (key(t) !== null) pred = t
+    else after.set(pred, [...(after.get(pred) ?? []), t])
+  }
+  const out = [...(after.get(null) ?? [])]
+  for (const t of keyed) out.push(t, ...(after.get(t) ?? []))
+  return out
 }
 
 /**
  * Normalize a listing to reading order (oldest first).
  *
- * - `collection` order is the creator's own order and is kept — unless its
- *   dates show it runs newest-first, in which case it is reversed.
- * - Otherwise: by publish date when every post has one, else by the chapter
- *   number in the title when every post has one, else (for a newest-first
- *   page listing) reversed.
+ * - `collection` order is the creator's own order and is kept — unless it
+ *   clearly runs newest-first ({@link looksNewestFirst}), then it is reversed.
+ * - Otherwise: by publish date when at least 80% of posts have one, else by
+ *   chapter number when at least 90% have one (undated / unnumbered posts stay
+ *   next to their neighbours), else (for a newest-first page listing) reversed.
  */
 export function orderOldestFirst(posts: PostRef[], order: ListingOrder): PostRef[] {
   if (posts.length < 2) return [...posts]
   const dates = posts.map(dateOf)
-  const allDated = dates.every((d) => d !== null)
+  const nums = posts.map(chapterNumberOf)
 
   if (order === "collection") {
-    const first = dates[0]
-    const last = dates[dates.length - 1]
-    return first !== null && last !== null && first > last ? [...posts].reverse() : [...posts]
+    return looksNewestFirst(dates, nums) ? [...posts].reverse() : [...posts]
   }
 
-  const indexed = posts.map((p, i) => ({ p, i, d: dates[i], n: chapterNumberOf(p) }))
-  if (allDated) {
-    return indexed
-      .sort((a, b) => (a.d as number) - (b.d as number) || (a.n ?? 0) - (b.n ?? 0) || a.i - b.i)
-      .map((x) => x.p)
+  const items = posts.map((p, i) => ({ p, i, d: dates[i], n: nums[i] }))
+  const base = order === "newest-first" ? [...items].reverse() : items
+  const pos = new Map(base.map((x, k) => [x, k]))
+  const byBase = (a: (typeof items)[0], b: (typeof items)[0]) => (pos.get(a) as number) - (pos.get(b) as number)
+  const dated = dates.filter((d) => d !== null).length
+  if (dated >= 2 && dated >= 0.8 * posts.length) {
+    return sortKeepingNeighbours(base, (x) => x.d, (a, b) => (a.n ?? 0) - (b.n ?? 0) || byBase(a, b)).map((x) => x.p)
   }
-  if (indexed.every((x) => x.n !== null)) {
-    return indexed.sort((a, b) => (a.n as number) - (b.n as number) || a.i - b.i).map((x) => x.p)
+  const numbered = nums.filter((n) => n !== null).length
+  if (numbered >= 2 && numbered >= 0.9 * posts.length) {
+    return sortKeepingNeighbours(base, (x) => x.n, byBase).map((x) => x.p)
   }
-  return order === "newest-first" ? [...posts].reverse() : [...posts]
+  return base.map((x) => x.p)
 }
 
 /**
