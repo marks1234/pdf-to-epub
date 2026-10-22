@@ -1,11 +1,13 @@
 /**
- * EPUB assembly for the extension — the main app's own pipeline
- * (`chaptersToEpub` with the default LitRPG styler), fed with chapters built
- * from post HTML.
+ * EPUB assembly for the extension: chapters built from post HTML, rendered with
+ * the app's `blocksToHtml` + default LitRPG styler, packaged by the eval-free
+ * writer (jepub's EJS templates need `new Function`, which the MV3
+ * content-script CSP forbids).
  */
-import { chaptersToEpub, type Chapter } from "@/lib/epub-book"
+import type { Chapter } from "@/lib/epub-book"
 import { createStyler, DEFAULT_STYLE_CONFIG } from "@/lib/styles"
 
+import { writeEpub, type WriterMeta } from "./epub-writer"
 import { htmlToBlocks } from "./html-to-blocks"
 import { cleanChapterTitle } from "./patreon-api"
 
@@ -15,7 +17,7 @@ export interface BookRequest {
   identifier: string
   description?: string
   notes?: string
-  /** JPEG or PNG bytes; dropped (not fatal) if jepub rejects them. */
+  /** JPEG or PNG bytes; dropped (not fatal) if the writer rejects them. */
   cover?: ArrayBuffer
   chapters: Chapter[]
 }
@@ -37,7 +39,7 @@ export function isJpegOrPng(bytes: ArrayBuffer): boolean {
 
 export async function buildBook(req: BookRequest): Promise<{ blob: Blob; coverDropped: boolean }> {
   const styler = createStyler(DEFAULT_STYLE_CONFIG)
-  const meta = {
+  const meta: WriterMeta = {
     title: req.title,
     author: req.author,
     publisher: "Patreon",
@@ -46,12 +48,12 @@ export async function buildBook(req: BookRequest): Promise<{ blob: Blob; coverDr
     notes: req.notes,
     language: "en",
   }
-  const cover = req.cover && isJpegOrPng(req.cover) ? new Blob([req.cover]) : undefined
+  const cover = req.cover && isJpegOrPng(req.cover) ? req.cover : undefined
   try {
-    return { blob: await chaptersToEpub(req.chapters, { ...meta, cover }, styler), coverDropped: false }
+    return { blob: await writeEpub(req.chapters, { ...meta, cover }, styler), coverDropped: false }
   } catch (e) {
     if (!cover) throw e
-    // A cover jepub can't take shouldn't cost the whole book.
-    return { blob: await chaptersToEpub(req.chapters, meta, styler), coverDropped: true }
+    // A cover the writer can't take shouldn't cost the whole book.
+    return { blob: await writeEpub(req.chapters, meta, styler), coverDropped: true }
   }
 }

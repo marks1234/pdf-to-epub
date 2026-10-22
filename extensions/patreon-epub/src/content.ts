@@ -6,12 +6,11 @@ import type { Chapter } from "@/lib/epub-book"
 import { downloadBlob } from "@/lib/download"
 import { sanitizeFilename } from "@/lib/format"
 
-import { isJpegOrPng, postToChapter } from "./build"
+import { buildBook, isJpegOrPng, postToChapter } from "./build"
 import { createHttp, isAbort, sleep, type Http } from "./http"
 import { collectionIdFromPath, parseCollectionDocTitle, postIdFromHref } from "./page-parse"
 import { listCollection, orderOldestFirst, ORIGIN, type Listing, type PostRef } from "./patreon-api"
 import { fetchPostContent, type PostResult } from "./posts"
-import { buildWithFallback, SandboxBuilder } from "./sandbox-client"
 import { Panel, type Skipped } from "./ui"
 
 interface State {
@@ -30,7 +29,6 @@ interface State {
 
 let state: State | null = null
 let panel: Panel | null = null
-let sandbox: SandboxBuilder | null = null
 
 // ── Page reading ─────────────────────────────────────────────────────────────
 
@@ -122,8 +120,6 @@ function showReady(): void {
     state.posts.map((p) => ({ label: p.title || `Post ${p.id}` })),
     note,
   )
-  // Warm up the builder frame while the user picks a range.
-  void sandbox?.ready()
 }
 
 async function fetchCover(http: Http, urls: string[]): Promise<ArrayBuffer | undefined> {
@@ -139,7 +135,7 @@ async function fetchCover(http: Http, urls: string[]): Promise<ArrayBuffer | und
 }
 
 async function start(from: number, to: number): Promise<void> {
-  if (!panel || !state || !sandbox) return
+  if (!panel || !state) return
   const st = state
   const selected = st.posts.slice(from, to + 1)
   const abort = new AbortController()
@@ -196,7 +192,7 @@ async function start(from: number, to: number): Promise<void> {
     const full = from === 0 && to === st.posts.length - 1
     const firstLabel = chapters[0].title
     const lastLabel = chapters[chapters.length - 1].title
-    const { blob, coverDropped } = await buildWithFallback(sandbox, {
+    const { blob, coverDropped } = await buildBook({
       title: st.bookTitle,
       author: st.author,
       identifier: `patreon-collection-${st.collectionId}`,
@@ -244,7 +240,6 @@ function mount(): void {
       if (state?.lastBook) downloadBlob(state.lastBook.blob, state.lastBook.filename, "application/epub+zip")
     },
   })
-  sandbox = new SandboxBuilder(panel.root)
 }
 
 function unmount(): void {
@@ -252,7 +247,6 @@ function unmount(): void {
   panel?.destroy()
   panel = null
   state = null
-  sandbox = null
 }
 
 // Patreon is a single-page app: follow client-side navigation between pages.

@@ -10,7 +10,7 @@
     "preview": "vite preview",
     "lint": "eslint .",
     "test": "vitest run",
-    "build:extension": "vite build -c extensions/patreon-epub/vite.config.ts --mode content && vite build -c extensions/patreon-epub/vite.config.ts --mode sandbox",
+    "build:extension": "vite build -c extensions/patreon-epub/vite.config.ts",
     "generate-pwa-assets": "pwa-assets-generator"
   },
   "dependencies": {
