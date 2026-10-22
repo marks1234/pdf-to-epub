@@ -6,7 +6,7 @@
   "host_permissions": ["https://www.patreon.com/*"],
   "content_scripts": [
     {
-      "matches": ["https://www.patreon.com/collection/*"],
+      "matches": ["https://www.patreon.com/*"],
       "js": ["content.js"],
       "run_at": "document_idle"
     }
