@@ -50,12 +50,10 @@ export async function buildBook(req: BookRequest): Promise<{ blob: Blob; coverDr
     notes: req.notes,
     language: "en",
   }
-  const cover = req.cover && isJpegOrPng(req.cover) ? req.cover : undefined
-  try {
-    return { blob: await writeEpub(req.chapters, { ...meta, cover }, styler), coverDropped: false }
-  } catch (e) {
-    if (!cover) throw e
-    // A cover the writer can't take shouldn't cost the whole book.
-    return { blob: await writeEpub(req.chapters, meta, styler), coverDropped: true }
-  }
+  // Gate the cover up front, so a writer error is never "retry without cover"
+  // (which used to build every chapter twice).
+  const cover = req.cover && isJpegOrPng(req.cover) && req.cover.byteLength <= MAX_COVER_BYTES ? req.cover : undefined
+  return { blob: await writeEpub(req.chapters, { ...meta, cover }, styler), coverDropped: !!req.cover && !cover }
 }
+
+const MAX_COVER_BYTES = 5_000_000
