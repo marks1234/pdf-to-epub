@@ -1,13 +1,7 @@
-import { describe, it, expect, vi } from "vitest"
+import { describe, it, expect } from "vitest"
 import JSZip from "jszip"
 
 import { buildBook, isJpegOrPng, postToChapter } from "./build"
-
-// See src/lib/epub-build.test.ts: Node resolves jepub's UMD bundle, so point
-// the import at the ESM build the browser uses.
-vi.mock("jepub", async () => ({
-  default: (await import("jepub/dist/jepub.es.js")).default,
-}))
 
 describe("postToChapter", () => {
   it("cleans the title and returns null for an empty body", () => {
@@ -64,8 +58,7 @@ describe("buildBook", () => {
 
   it("drops a cover the builder rejects instead of failing", async () => {
     const chapters = [postToChapter({ title: "C1", html: "<p>x</p>" })!]
-    // Valid JPEG magic, garbage after: jepub may or may not accept it; either
-    // way the book must build.
+    // Valid JPEG magic, garbage after: the book must build either way.
     const cover = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3]).buffer
     const { blob } = await buildBook({ title: "B", author: "A", identifier: "id", chapters, cover })
     expect(blob.size).toBeGreaterThan(0)

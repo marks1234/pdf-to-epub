@@ -1,8 +1,9 @@
 # Patreon Collection → EPUB (Chrome extension)
 
 Saves a Patreon **collection you already have access to** as a single EPUB, for
-reading offline on a Kindle or other e-reader. It reuses the main app's EPUB
-pipeline (`chaptersToEpub`, LitRPG stat/rarity styling, EPUB 3 normalization).
+reading offline on a Kindle or other e-reader. It reuses the main app's
+chapter rendering and LitRPG stat/rarity styling, and writes the same EPUB 3
+package the app produces.
 
 It only fetches posts your logged-in account can already read, using the same
 requests Patreon's own website makes. Locked or tier-gated posts are skipped and
@@ -63,11 +64,13 @@ npm run build:extension
   justify become CSS classes. `h1`–`h6`, `blockquote`, lists and `<hr>` are
   kept. `* * *`-style lines become scene breaks. Other markup (links, images,
   spans, scripts, attributes) is reduced to plain text.
-- **Building**: jepub compiles its templates with `new Function`, which MV3
-  content scripts aren't allowed to run. So the EPUB is built in a sandboxed
-  extension page (`sandbox.html`), loaded in a hidden iframe and reached over a
-  private `MessageChannel`. If that frame can't load, the build is tried
-  directly in the content script as a last resort.
+- **Building**: the app's EPUB library (jepub) compiles its templates with
+  `new Function`, which the MV3 content-script CSP forbids. So the extension
+  has its own eval-free writer (`src/epub-writer.ts`, JSZip only) and builds
+  the book directly in the content script: EPUB 3 with `mimetype` first and
+  stored, an OPF with cover metadata, `nav.xhtml` plus a retained NCX, a TOC
+  page, a cover page, and one XHTML5 page per chapter linked to the app's
+  stylesheet.
 - **Permissions**: host access to `https://www.patreon.com/*` only. The
   download uses a blob URL, so the `downloads` permission isn't needed.
 
@@ -91,7 +94,10 @@ npm run build:extension
 ## Development
 
 Sources are in `src/`. The pure parts (HTML→blocks, API parsing and
-pagination, ordering, page parsing, HTTP retry) have vitest tests that run
-with the root `npm test`. `vite.config.ts` builds the IIFE bundles
-(`--mode content` and `--mode sandbox`). `public/` holds `manifest.json` and
-`sandbox.html`.
+pagination, ordering, page parsing, HTTP retry, the EPUB writer) have vitest
+tests that run with the root `npm test`. `vite.config.ts` builds the single
+IIFE bundle `dist/content.js`. `public/` holds `manifest.json`.
+
+The bundle must never contain `new Function` or jepub; check after building
+with `grep -c "new Function\|jepub" extensions/patreon-epub/dist/content.js`
+(expect 0). Don't import values from `@/lib/epub-book` (type imports are fine).
