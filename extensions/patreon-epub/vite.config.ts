@@ -3,13 +3,18 @@
  *
  *   vite build -c extensions/patreon-epub/vite.config.ts
  *
- * Emits dist/content.js (an IIFE — content scripts can't be ES modules) and
- * copies public/ (manifest.json). The EPUB is written by an eval-free writer
- * (src/epub-writer.ts), so the bundle must never contain `new Function`; MV3
- * content scripts forbid 'unsafe-eval'.
+ * Emits two bundles plus public/ (manifest.json):
+ * - dist/app.js — the whole extension as an ES module (src/app.ts), exposed as
+ *   a web-accessible resource and imported on demand;
+ * - dist/content.js — the tiny bootstrap content script (src/bootstrap.ts), an
+ *   IIFE (content scripts can't be ES modules) injected on every Patreon page;
+ *   it imports app.js only when a collection page is seen.
+ *
+ * The EPUB is written by an eval-free writer (src/epub-writer.ts), so neither
+ * bundle may contain `new Function` or `eval(`; MV3 forbids 'unsafe-eval'.
  */
 import path from "node:path"
-import { defineConfig, type Plugin } from "vite"
+import { build, defineConfig, type Plugin, type UserConfig } from "vite"
 
 /**
  * JSZip bundles the `setimmediate` polyfill, whose `setImmediate` turns a
@@ -21,7 +26,7 @@ import { defineConfig, type Plugin } from "vite"
 function noEval(): Plugin {
   return {
     name: "patreon-epub-no-eval",
-    renderChunk(code) {
+    renderChunk(code, chunk) {
       const out = code.replace(
         /new Function\(\s*""\s*\+\s*([\w$]+)\s*\)/g,
         (_all, arg: string) => `(function () { throw new TypeError("setImmediate needs a function, got " + ${arg}) })`,
@@ -29,17 +34,18 @@ function noEval(): Plugin {
       const left = /new Function\b|\beval\s*\(/.exec(out)
       if (left) {
         const at = out.slice(Math.max(0, left.index - 120), left.index + 60)
-        throw new Error(`content.js would contain "${left[0]}", which the MV3 content-script CSP blocks:\n${at}`)
+        throw new Error(`${chunk.fileName} would contain "${left[0]}", which the MV3 CSP blocks:\n${at}`)
       }
       return { code: out, map: null }
     },
   }
 }
 
-export default defineConfig({
+const outDir = path.resolve(__dirname, "dist")
+
+const shared: UserConfig = {
   root: __dirname,
   plugins: [noEval()],
-  publicDir: path.resolve(__dirname, "public"),
   resolve: {
     alias: { "@": path.resolve(__dirname, "../../src") },
   },
@@ -47,19 +53,53 @@ export default defineConfig({
     // Some deps probe process.env.NODE_ENV; there is no `process` in a page.
     "process.env.NODE_ENV": JSON.stringify("production"),
   },
+}
+
+/** After app.js is written, build the bootstrap into the same dist/. */
+function bootstrapBuild(): Plugin {
+  return {
+    name: "patreon-epub-bootstrap",
+    apply: "build",
+    async closeBundle() {
+      await build({
+        ...shared,
+        configFile: false,
+        publicDir: false,
+        logLevel: "warn",
+        build: {
+          outDir,
+          emptyOutDir: false,
+          target: "chrome116",
+          minify: true,
+          sourcemap: false,
+          lib: {
+            entry: path.resolve(__dirname, "src/bootstrap.ts"),
+            formats: ["iife"],
+            name: "PatreonEpubBootstrap",
+            fileName: () => "content.js",
+          },
+        },
+      })
+    },
+  }
+}
+
+export default defineConfig({
+  ...shared,
+  plugins: [noEval(), bootstrapBuild()],
+  publicDir: path.resolve(__dirname, "public"),
   build: {
-    outDir: path.resolve(__dirname, "dist"),
+    outDir,
     emptyOutDir: true,
-    target: "chrome110",
+    target: "chrome116",
     // An unpacked extension doesn't need minifying, and readable output is
     // easier to debug from chrome://extensions.
     minify: false,
     sourcemap: false,
     lib: {
-      entry: path.resolve(__dirname, "src/content.ts"),
-      formats: ["iife"],
-      name: "PatreonEpubContent",
-      fileName: () => "content.js",
+      entry: path.resolve(__dirname, "src/app.ts"),
+      formats: ["es"],
+      fileName: () => "app.js",
     },
   },
 })

@@ -1,6 +1,7 @@
 /**
- * Content script for https://www.patreon.com/collection/* — lists the
- * collection, fetches each post the user can read, and saves one EPUB.
+ * The extension's app module (dist/app.js), loaded by the tiny bootstrap
+ * content script only once a collection page is seen. Lists the collection,
+ * fetches each post the user can read, and saves one EPUB.
  */
 import type { Chapter } from "@/lib/epub-book"
 
@@ -357,6 +358,5 @@ export function sync(): void {
   unmount()
   if (id) mount(id)
 }
-
-sync()
-setInterval(sync, 1000)
+// No top-level side effects: bootstrap.ts imports this module on the first
+// collection page and calls sync() on every navigation after that.
