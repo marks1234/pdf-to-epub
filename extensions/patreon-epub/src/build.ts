@@ -6,6 +6,7 @@
  */
 import type { Chapter } from "@/lib/epub-book"
 import type { Block } from "@/lib/reconstruct"
+import { sanitizeFilename } from "@/lib/format"
 import { createStyler, DEFAULT_STYLE_CONFIG } from "@/lib/styles"
 
 import { writeEpub, type WriterMeta } from "./epub-writer"
@@ -29,6 +30,16 @@ export function postToChapter(post: { title: string; html: string; blocks?: Bloc
   const blocks = post.html.trim() ? htmlToBlocks(post.html) : (post.blocks ?? [])
   if (blocks.every((b) => b.type === "hr")) return null
   return { title: cleanChapterTitle(post.title, bookTitle), blocks }
+}
+
+/**
+ * `<title>.epub`, or `<title> (from-to).epub` for a partial range. The title is
+ * truncated before the suffix is added, so a long title never loses the range.
+ */
+export function bookFilename(title: string, range?: [number, number]): string {
+  const suffix = range ? ` (${range[0]}-${range[1]})` : ""
+  const stem = sanitizeFilename(title).slice(0, 120 - suffix.length).replace(/[.\s]+$/, "")
+  return `${stem || "untitled"}${suffix}.epub`
 }
 
 /** Is this a JPEG or PNG? (The only cover formats worth handing to Kindle.) */
