@@ -19,6 +19,8 @@ export interface PostRef {
   title?: string
   publishedAt?: string
   url?: string
+  /** `current_user_can_view` from the listing, when present. */
+  canView?: boolean
 }
 
 export interface ListPage {

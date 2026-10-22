@@ -94,13 +94,16 @@ function tagStartBefore(html: string, at: number): number {
  * starts with `RichText-module` inside `.patreon-post-content`.
  */
 export function postBodyFromPageHtml(html: string): string | null {
-  const wrapper = /class\s*=\s*["'][^"']*\bpatreon-post-content\b/i.exec(html)
-  const from = wrapper ? wrapper.index : 0
-  const rich = /class\s*=\s*["'](?:[^"']*\s)?RichText-module/g
-  rich.lastIndex = from
-  const m = rich.exec(html)
+  // Only inside the post-content wrapper: elsewhere a RichText block is the
+  // about blurb, a tier description or a comment, never the chapter.
+  const wrapper =
+    /class\s*=\s*["'][^"']*\bpatreon-post-content\b/i.exec(html) ?? /data-tag\s*=\s*["']post-content["']/i.exec(html)
+  if (!wrapper) return null
+  const inner = innerHtmlAt(html, tagStartBefore(html, wrapper.index))
+  if (inner == null) return null
+  const m = /class\s*=\s*["'](?:[^"']*\s)?RichText-module/.exec(inner)
   if (!m) return null
-  return innerHtmlAt(html, tagStartBefore(html, m.index))
+  return innerHtmlAt(inner, tagStartBefore(inner, m.index))
 }
 
 /** The post title from `[data-tag="post-title"]`, as plain text. */

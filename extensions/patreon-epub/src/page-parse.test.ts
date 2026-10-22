@@ -36,6 +36,18 @@ describe("post page parsing", () => {
     expect(postBodyFromPageHtml("<html><div id='root'></div></html>")).toBeNull()
     expect(postTitleFromPageHtml("<html></html>")).toBeNull()
   })
+
+  it("only takes RichText inside the post-content wrapper", () => {
+    expect(postBodyFromPageHtml('<div class="RichText-module__a__root"><p>About the creator</p></div>')).toBeNull()
+    expect(
+      postBodyFromPageHtml(
+        '<div class="patreon-post-content"></div><div class="Comments"><div class="RichText-module__a__root"><p>comment</p></div></div>',
+      ),
+    ).toBeNull()
+    expect(
+      postBodyFromPageHtml('<div data-tag="post-content"><div class="RichText-module__a__root"><p>Body</p></div></div>'),
+    ).toBe("<p>Body</p>")
+  })
 })
 
 describe("collection page parsing", () => {
