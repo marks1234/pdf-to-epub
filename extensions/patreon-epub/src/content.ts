@@ -3,14 +3,16 @@
  * collection, fetches each post the user can read, and saves one EPUB.
  */
 import type { Chapter } from "@/lib/epub-book"
-import { downloadBlob } from "@/lib/download"
-import { sanitizeFilename } from "@/lib/format"
 
-import { buildBook, isJpegOrPng, postToChapter } from "./build"
-import { createHttp, isAbort, sleep, type Http } from "./http"
-import { collectionIdFromPath, parseCollectionDocTitle, postIdFromHref } from "./page-parse"
-import { listCollection, orderOldestFirst, ORIGIN, type Listing, type PostRef } from "./patreon-api"
-import { fetchPostContent, type PostResult } from "./posts"
+import { bookFilename, buildBook, isJpegOrPng, postToChapter } from "./build"
+import * as diag from "./diag"
+import { createHttp, isAbort, type Http } from "./http"
+import { harvestPage, trustedOg, visiblePostIds } from "./page-dom"
+import { acceptCoverUrl, collectionIdFromPath, parseCollectionDocTitle } from "./page-parse"
+import { listCollection, orderOldestFirst, type Listing, type PostRef } from "./patreon-api"
+import * as postCache from "./post-cache"
+import type { PostResult } from "./posts"
+import { createPool, fetchAll, orderResults } from "./run"
 import { Panel, type Skipped } from "./ui"
 
 interface State {
@@ -21,104 +23,125 @@ interface State {
   coverUrls: string[]
   posts: PostRef[]
   listing?: Listing
-  /** Fetched posts survive a cancel, so a restart doesn't refetch them. */
+  /** Fetched posts survive a cancel, halt or navigation, so a restart doesn't refetch them. */
   cache: Map<string, PostResult>
   abort?: AbortController
+  running?: "listing" | "fetching"
+  listingPromise?: Promise<void>
+  lastRange?: [number, number]
   lastBook?: { blob: Blob; filename: string }
 }
 
+/** One session per collection, so Back / re-opening keeps the listing and fetched posts. */
+const sessions = new Map<string, State>()
+const MAX_SESSIONS = 3
 let state: State | null = null
 let panel: Panel | null = null
+/** The collection whose posts are being fetched (at most one at a time). */
+let activeFetch: State | null = null
+/** Navigation happened during a fetch: swap panels once it ends. */
+let pendingUnmount = false
 
-// ── Page reading ─────────────────────────────────────────────────────────────
+const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e))
 
-function visiblePostIds(collectionId: string): string[] {
-  const ids: string[] = []
-  for (const a of document.querySelectorAll<HTMLAnchorElement>('a[href*="/posts/"]')) {
-    const id = postIdFromHref(a.href, collectionId)
-    if (id && !ids.includes(id)) ids.push(id)
-  }
-  return ids
+function onBeforeUnload(e: BeforeUnloadEvent): void {
+  e.preventDefault()
+  e.returnValue = ""
 }
 
-function findLoadMore(): HTMLButtonElement | null {
-  for (const b of document.querySelectorAll<HTMLButtonElement>("button")) {
-    if (b.textContent?.trim().toLowerCase() === "load more" && !b.disabled) return b
-  }
-  return null
-}
-
-/** Last-resort listing: click "Load more" until no new post links appear. */
-async function harvestPage(collectionId: string, signal: AbortSignal, onCount: (n: number) => void): Promise<string[]> {
-  let ids = visiblePostIds(collectionId)
-  let stalls = 0
-  for (let round = 0; round < 100 && stalls < 2; round++) {
-    const button = findLoadMore()
-    if (!button) break
-    button.click()
-    const before = ids.length
-    // Wait up to ~10s for new links to render.
-    for (let t = 0; t < 20; t++) {
-      await sleep(500, signal)
-      ids = visiblePostIds(collectionId)
-      if (ids.length > before) break
-    }
-    stalls = ids.length > before ? 0 : stalls + 1
-    onCount(ids.length)
-    await sleep(600 + Math.random() * 300, signal)
-  }
-  return ids
-}
-
-function metaContent(property: string): string | undefined {
-  return document.querySelector<HTMLMetaElement>(`meta[property="${property}"]`)?.content || undefined
+function addCover(st: State, url: string | undefined, first = false): void {
+  if (!acceptCoverUrl(url) || st.coverUrls.includes(url)) return
+  if (first) st.coverUrls.unshift(url)
+  else st.coverUrls.push(url)
 }
 
 // ── Flow ─────────────────────────────────────────────────────────────────────
 
 async function openPanel(): Promise<void> {
-  if (!panel || !state) return
-  if (state.posts.length > 0) return showReady()
-  const abort = new AbortController()
-  state.abort = abort
-  panel.showBusy("Listing chapters…")
   const st = state
-  try {
-    const http = createHttp({ signal: abort.signal })
-    // The SPA may have set the title after mount; re-read it now.
-    const info = parseCollectionDocTitle(document.title)
-    if (info.title) st.bookTitle = info.title
-    if (info.creator) st.author = info.creator
-    const listing = await listCollection(st.collectionId, {
-      fetchJson: (url) => http.getJson(url),
-      harvestPage: () => harvestPage(st.collectionId, abort.signal, (n) => panel?.showBusy(`Loading the list… ${n} posts so far`)),
-      visibleIds: visiblePostIds(st.collectionId),
-      expectedCount: info.postCount,
-      onStep: (m) => panel?.showBusy(m),
-    })
-    st.listing = listing
-    st.posts = orderOldestFirst(listing.posts, listing.order)
-    if (listing.collection?.title) st.bookTitle = listing.collection.title
-    if (listing.collection?.creator && !info.creator) st.author = listing.collection.creator
-    if (listing.collection?.description) st.description = listing.collection.description
-    if (listing.collection?.coverUrl) st.coverUrls.unshift(listing.collection.coverUrl)
-    showReady()
-  } catch (e) {
-    if (isAbort(e)) return panel.showButton()
-    panel.showError(e instanceof Error ? e.message : String(e), () => void openPanel())
+  const p = panel
+  if (!st || !p || st.running) return
+  if (st.posts.length > 0) return showReady(st, p)
+
+  // Metadata is read now, not at mount: the SPA sets title / og tags late.
+  const info = parseCollectionDocTitle(document.title)
+  const og = trustedOg(document, st.collectionId)
+  const ogInfo = og.title ? parseCollectionDocTitle(og.title) : {}
+  if (info.title ?? ogInfo.title) st.bookTitle = (info.title ?? ogInfo.title) as string
+  if (info.creator ?? ogInfo.creator) st.author = (info.creator ?? ogInfo.creator) as string
+  addCover(st, og.image)
+
+  const abort = new AbortController()
+  st.abort = abort
+  st.running = "listing"
+  const live = () => !abort.signal.aborted && st.abort === abort
+  p.showBusy("Listing chapters…")
+  diag.log(`listing collection ${st.collectionId}`)
+  const run = async () => {
+    try {
+      const http = createHttp({ signal: abort.signal, onAttempt: diag.logAttempt, onJson: diag.logShape })
+      const listing = await listCollection(st.collectionId, {
+        fetchJson: (url) => http.getJson(url),
+        harvestPage: (expected) =>
+          harvestPage(st.collectionId, abort.signal, (n) => live() && p.showBusy(`Loading the list… ${n} posts so far`), expected),
+        visibleIds: visiblePostIds(st.collectionId),
+        expectedCount: info.postCount ?? ogInfo.postCount,
+        onStep: (m) => live() && p.showBusy(m),
+        log: diag.log,
+      })
+      if (!live()) return
+      st.listing = listing
+      st.posts = orderOldestFirst(listing.posts, listing.order)
+      const c = listing.collection
+      if (c?.title) st.bookTitle = c.title
+      if (c?.creator && !info.creator) st.author = c.creator
+      if (c?.description) st.description = c.description
+      addCover(st, c?.coverUrl, true)
+      // Chapters saved by an earlier visit: one storage read, merged up front.
+      for (const [id, r] of await postCache.getMany(st.posts.map((x) => x.id))) if (!st.cache.has(id)) st.cache.set(id, r)
+      if (live()) showReady(st, p)
+    } catch (e) {
+      if (isAbort(e) || !live()) return void (st.abort === abort && p.showButton())
+      diag.log(`listing error: ${errMsg(e)}`)
+      p.showError(errMsg(e), () => void openPanel())
+    } finally {
+      if (st.abort === abort) st.running = undefined
+    }
   }
+  st.listingPromise = run().finally(() => (st.listingPromise = undefined))
+  return st.listingPromise
 }
 
-function showReady(): void {
-  if (!panel || !state) return
+function showReady(st: State, p: Panel): void {
+  const l = st.listing
   const note =
-    state.listing?.source === "page"
+    l?.source === "page" || l?.source === "page-untagged"
       ? "Listed from the page (the API listing was unavailable); order is fixed by publish date after fetching."
       : undefined
-  panel.showReady(
-    state.bookTitle,
-    state.posts.map((p) => ({ label: p.title || `Post ${p.id}` })),
+  const warnings: string[] = []
+  if (l?.incomplete) {
+    warnings.push(
+      `Found ${l.incomplete.found}${l.incomplete.expected ? ` of ${l.incomplete.expected}` : ""} posts — the book may be incomplete.`,
+    )
+    for (const n of l.notes ?? []) warnings.push(n)
+  } else if (l?.source === "page-untagged") {
+    warnings.push(...(l.notes ?? []))
+  }
+  const saved = st.posts.filter((x) => st.cache.get(x.id)?.ok).length
+  p.showReady(
+    st.bookTitle,
+    st.posts.map((x) => ({ label: `${x.title || `Post ${x.id}`}${x.canView === false ? " (locked)" : ""}` })),
     note,
+    {
+      saved,
+      onClearSaved: () => {
+        void postCache.clear()
+        st.cache.clear()
+        showReady(st, p)
+      },
+      warnings,
+      range: st.lastRange,
+    },
   )
 }
 
@@ -127,137 +150,207 @@ async function fetchCover(http: Http, urls: string[]): Promise<ArrayBuffer | und
     try {
       const bytes = await http.getBytes(url)
       if (isJpegOrPng(bytes)) return bytes
+      diag.log(`cover ${diag.describeUrl(url)}: not JPEG/PNG`)
     } catch (e) {
       if (isAbort(e)) throw e
+      diag.log(`cover ${diag.describeUrl(url)}: ${errMsg(e)}`)
     }
   }
   return undefined
 }
 
+const fmtWait = (ms: number) => {
+  const s = Math.ceil(ms / 1000)
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`
+}
+
 async function start(from: number, to: number): Promise<void> {
-  if (!panel || !state) return
   const st = state
-  const selected = st.posts.slice(from, to + 1)
+  const p = panel
+  if (!st || !p || st.running) return
+  if (activeFetch && activeFetch !== st) return p.showError("Finish or cancel the current book first.")
+  st.running = "fetching"
+  activeFetch = st
+  st.lastRange = [from, to]
   const abort = new AbortController()
   st.abort = abort
-  const http = createHttp({ signal: abort.signal })
-  panel.showProgress()
+  const stale = () => void (st.abort === abort && showReady(st, p))
+  addEventListener("beforeunload", onBeforeUnload)
+  const pool = createPool(1, 1)
+  const http = createHttp({
+    signal: abort.signal,
+    onWait: (ms) => {
+      pool.rateLimited()
+      p.setPause(`Patreon asked us to slow down — resuming in ${fmtWait(ms)}`)
+    },
+    onAttempt: diag.logAttempt,
+    onJson: diag.logShape,
+  })
+  const selected = st.posts.slice(from, to + 1)
+  diag.log(`start ${from + 1}-${to + 1} of ${st.posts.length}`)
+  p.showProgress()
+  let phase = "while fetching posts"
 
   try {
-    const fetched: PostResult[] = []
-    for (let i = 0; i < selected.length; i++) {
-      const ref = selected[i]
-      const label = ref.title || `Post ${ref.id}`
-      panel.setProgress(i, selected.length, `Fetching ${i + 1} / ${selected.length} — ${label}`)
-      let result = st.cache.get(ref.id)
-      if (!result) {
-        result = await fetchPostContent(ref, http)
-        // Only cache successes: a transient failure should be retried next run.
-        if (result.ok) st.cache.set(ref.id, result)
-      }
-      fetched.push(result)
-    }
+    const missing = selected.map((r) => r.id).filter((id) => !st.cache.has(id))
+    for (const [id, r] of await postCache.getMany(missing)) st.cache.set(id, r)
 
-    // A page-harvested listing had no dates up front; order by what we learned.
-    let ordered = fetched
-    if (st.listing?.order === "newest-first") {
-      const refs = orderOldestFirst(
-        fetched.map((r) => ({ id: r.id, title: r.title, publishedAt: r.ok ? r.publishedAt : undefined })),
-        "newest-first",
+    const { results, halted } = await fetchAll(selected, {
+      http,
+      cache: st.cache,
+      signal: abort.signal,
+      pool,
+      onProgress: (done, total, label) => p.setProgress(done, total, `Fetched ${done} / ${total} — ${label}`),
+      onPause: (m) => p.setPause(m),
+      onResult: (r) => void postCache.put(r),
+      log: diag.log,
+    })
+    if (halted) {
+      const kept = results.filter((r) => r.ok).length
+      diag.log(`halted (${halted.kind}) at ${halted.index}`)
+      p.showError(
+        `Stopped at ${halted.index + 1}/${selected.length}: ${halted.message}. ${kept} chapters fetched and kept — Retry resumes from here.`,
+        () => void start(from, to).catch((e) => console.error("[patreon-epub]", e)),
       )
-      const byId = new Map(fetched.map((r) => [r.id, r]))
-      ordered = refs.map((r) => byId.get(r.id) as PostResult)
-    }
-
-    const chapters: Chapter[] = []
-    const skipped: Skipped[] = []
-    for (const r of ordered) {
-      if (!r.ok) {
-        skipped.push({ title: r.title, reason: r.reason })
-        continue
-      }
-      const chapter = postToChapter(r, st.bookTitle)
-      if (chapter) chapters.push(chapter)
-      else skipped.push({ title: r.title, reason: "no text in the post body" })
-    }
-    if (chapters.length === 0) {
-      panel.showError("None of the selected posts had readable text — nothing to save.", () => showReady())
       return
     }
 
-    panel.setProgress(selected.length, selected.length, "Fetching cover…")
-    const cover = await fetchCover(http, st.coverUrls)
-    panel.setProgress(selected.length, selected.length, "Building EPUB…")
+    phase = "while preparing chapters"
+    const chapters: Chapter[] = []
+    const skipped: Skipped[] = []
+    orderResults(results, st.listing?.order ?? "collection").forEach((r, i) => {
+      if (!r.ok) return void skipped.push({ title: r.title, reason: r.reason, kind: r.kind })
+      try {
+        const chapter = postToChapter(r, st.bookTitle)
+        if (chapter) chapters.push(chapter)
+        else skipped.push({ title: r.title, reason: "no text in the post body", kind: "empty" })
+      } catch (e) {
+        diag.log(`convert error at chapter ${i} (post ${r.id}): ${errMsg(e)}`)
+        skipped.push({ title: r.title, reason: `could not convert (post ${r.id}): ${errMsg(e)}`, kind: "empty" })
+      }
+    })
+    if (chapters.length === 0) {
+      p.showError("None of the selected posts had readable text — nothing to save.", () => showReady(st, p))
+      return
+    }
 
+    phase = "while fetching the cover"
+    p.setProgress(selected.length, selected.length, "Fetching cover…")
+    const cover = await fetchCover(http, st.coverUrls)
+    if (abort.signal.aborted) return stale()
+
+    phase = "while building the EPUB"
+    p.setProgress(selected.length, selected.length, "Building EPUB…")
     const full = from === 0 && to === st.posts.length - 1
-    const firstLabel = chapters[0].title
-    const lastLabel = chapters[chapters.length - 1].title
     const { blob, coverDropped } = await buildBook({
       title: st.bookTitle,
       author: st.author,
       identifier: `patreon-collection-${st.collectionId}`,
-      description: [st.description, `${firstLabel} – ${lastLabel}`].filter(Boolean).join("\n\n"),
+      description: [st.description, `${chapters[0].title} – ${chapters[chapters.length - 1].title}`].filter(Boolean).join("\n\n"),
       notes: `Compiled from Patreon collection ${st.collectionId} (${chapters.length} chapters) on ${new Date().toISOString().slice(0, 10)}, for personal offline reading.`,
       cover,
       chapters,
     })
+    if (abort.signal.aborted) return stale()
 
-    const stem = sanitizeFilename(full ? st.bookTitle : `${st.bookTitle} (${from + 1}-${to + 1})`)
-    const filename = `${stem}.epub`
+    const filename = bookFilename(st.bookTitle, full ? undefined : [from + 1, to + 1])
     st.lastBook = { blob, filename }
-    downloadBlob(blob, filename, "application/epub+zip")
+    p.download(blob, filename)
+    diag.log(`built ${chapters.length} chapters, ${skipped.length} skipped, ${blob.size} bytes`)
 
     const notes: string[] = []
     if (!cover) notes.push("No cover image could be fetched; the book has none.")
-    if (coverDropped) notes.push("The cover image was rejected by the EPUB builder and left out.")
-    panel.showDone(filename, chapters.length, skipped, notes)
+    if (coverDropped) notes.push("The cover image wasn't a usable JPEG/PNG and was left out.")
+    p.showDone(filename, chapters.length, skipped, notes, () => void start(from, to).catch((e) => console.error("[patreon-epub]", e)))
   } catch (e) {
-    if (isAbort(e)) return showReady()
-    panel.showError(e instanceof Error ? e.message : String(e), () => showReady())
+    if (isAbort(e)) return stale()
+    diag.log(`error ${phase}: ${errMsg(e)}`)
+    p.showError(`Failed ${phase}: ${errMsg(e)}`, () => showReady(st, p))
+  } finally {
+    if (st.abort === abort) st.running = undefined
+    if (activeFetch === st) activeFetch = null
+    removeEventListener("beforeunload", onBeforeUnload)
+    // Navigated away mid-fetch: the result stays on screen; the next navigation swaps panels.
+    if (pendingUnmount) diag.log("fetch finished after navigating away; panel kept as an overlay")
   }
 }
 
 // ── Mount / SPA navigation ───────────────────────────────────────────────────
 
-function mount(): void {
-  const collectionId = collectionIdFromPath(location.pathname)
-  if (!collectionId) return
-  const info = parseCollectionDocTitle(document.title || metaContent("og:title") || "")
-  const og = metaContent("og:image")
-  state = {
-    collectionId,
-    bookTitle: info.title || `Patreon collection ${collectionId}`,
-    author: info.creator || "Unknown",
-    coverUrls: og && og.startsWith(`${ORIGIN}/`) ? [og] : [],
-    posts: [],
-    cache: new Map(),
+let pruned = false
+
+function mount(collectionId: string): void {
+  if (!pruned) {
+    pruned = true
+    void postCache.prune()
   }
+  let st = sessions.get(collectionId)
+  if (!st) {
+    st = {
+      collectionId,
+      bookTitle: `Patreon collection ${collectionId}`,
+      author: "Unknown",
+      coverUrls: [],
+      posts: [],
+      cache: new Map(),
+    }
+    sessions.set(collectionId, st)
+    // Keep a few sessions; evict the oldest that isn't busy.
+    for (const [id, s] of sessions) {
+      if (sessions.size <= MAX_SESSIONS) break
+      if (!s.running && s !== st) sessions.delete(id)
+    }
+  } else {
+    // Refresh recency.
+    sessions.delete(collectionId)
+    sessions.set(collectionId, st)
+  }
+  state = st
   panel = new Panel({
-    onOpen: () => void openPanel(),
-    onStart: (from, to) => void start(from, to),
+    onOpen: () => void openPanel().catch((e) => console.error("[patreon-epub]", e)),
+    onStart: (from, to) => void start(from, to).catch((e) => console.error("[patreon-epub]", e)),
     onCancel: () => state?.abort?.abort(),
     onDownloadAgain: () => {
-      if (state?.lastBook) downloadBlob(state.lastBook.blob, state.lastBook.filename, "application/epub+zip")
+      if (state?.lastBook) panel?.download(state.lastBook.blob, state.lastBook.filename)
     },
+    diagnostics: diag.text,
   })
 }
 
 function unmount(): void {
-  state?.abort?.abort()
+  // A listing needs this collection's DOM; a fetch never reaches here (see sync).
+  if (state?.running === "listing") state.abort?.abort()
   panel?.destroy()
   panel = null
   state = null
+  removeEventListener("beforeunload", onBeforeUnload)
 }
 
 // Patreon is a single-page app: follow client-side navigation between pages.
 let lastPath = ""
-function sync(): void {
+let warnedPath = false
+export function sync(): void {
+  // Only a real path change swaps panels; a finished overlay stays until then.
   if (location.pathname === lastPath) return
   lastPath = location.pathname
   const id = collectionIdFromPath(location.pathname)
-  if (state && state.collectionId === id) return
+  if (!id && !warnedPath && location.pathname.includes("/collection")) {
+    warnedPath = true
+    console.debug("[patreon-epub] collection path without an id:", location.pathname)
+    diag.log("collection path without a parsable id")
+  }
+  if (state && state.collectionId === id) {
+    pendingUnmount = false
+    return
+  }
+  // A running fetch keeps its panel as an overlay and finishes with it.
+  if (state?.running === "fetching") {
+    pendingUnmount = true
+    return
+  }
+  pendingUnmount = false
   unmount()
-  if (id) mount()
+  if (id) mount(id)
 }
 
 sync()
