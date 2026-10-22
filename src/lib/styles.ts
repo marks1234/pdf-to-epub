@@ -405,6 +405,11 @@ export function cssFromConfig(config: StyleConfig): string {
     ".stat-block{margin:0.4em 0;padding-left:1.4em;list-style:disc;}",
     ".stat-block li{margin:0.12em 0;}",
     ".pct{font-weight:700;}",
+    // Paragraph alignment carried over from rich (HTML) sources.
+    ".align-center{text-align:center;text-indent:0;}",
+    ".align-right{text-align:right;text-indent:0;}",
+    ".align-justify{text-align:justify;}",
+    "blockquote{margin:1em 1.5em;}",
     ...config.rarities.map((t) => `.rarity-${safeKey(t.key)}{${textStyleCss(t.style)}}`),
     ...config.keywords.map((g) => `.kw-${safeKey(g.key)}{${textStyleCss(g.style)}}`),
   ].join("\n")

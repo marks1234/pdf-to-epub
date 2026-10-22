@@ -2,19 +2,15 @@ import * as pdfjsLib from "pdfjs-dist"
 import type { TextItem } from "pdfjs-dist/types/src/display/api"
 // Vite resolves this to a hashed URL for the pdf.js worker bundle.
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url"
-import jEpub from "jepub"
-
-import { normalizeOcf } from "@/lib/epub-normalize"
 import { chapterTitle } from "@/lib/titles"
 import {
   DEFAULT_STYLER,
-  blocksToHtml,
   reconstructChapterBlocks,
-  type Block,
   type Glyph,
 } from "@/lib/reconstruct"
 import { dehyphenateAll, normalizeCharacters } from "@/lib/cleanup"
-import { createStyler, type StyleConfig, type Styler } from "@/lib/styles"
+import { createStyler, type StyleConfig } from "@/lib/styles"
+import { chaptersToEpub, type Chapter, type EpubMetadata } from "@/lib/epub-book"
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl
 
@@ -23,52 +19,10 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl
 // but it is part of this module's public surface.
 export { chapterTitle } from "@/lib/titles"
 
-export interface EpubMetadata {
-  title: string
-  author: string
-  publisher?: string
-  description?: string
-  /**
-   * BCP-47 language tag, default `"en"`. Drives `dc:language`, which is what
-   * Kindle uses to pick its font stack.
-   */
-  language?: string
-  /** Series name — written as calibre + EPUB 3 collection metadata. */
-  series?: string
-  /** 1-based position within `series`. */
-  seriesIndex?: number
-  /**
-   * Cover image. A book without an embedded cover shows up on Kindle as "Docs"
-   * with a raw filename. Aim for a JPEG, sRGB, no alpha, ≥1200px on the long edge.
-   */
-  cover?: Blob
-  /**
-   * Stable `dc:identifier`. Pass the same value on every re-style so devices
-   * treat the result as a new version of one book rather than a new book.
-   */
-  identifier?: string
-}
-
-/**
- * The UI languages jepub ships. `init()` throws on anything else, so an
- * unsupported tag falls back to English for jepub's own strings — `dc:language`
- * still carries the requested tag (set during normalization).
- */
-const JEPUB_UI_LANGUAGES = new Set([
-  "en", "vi", "hi", "fr", "de", "es", "it", "pt", "ru", "ja", "ko",
-  "zh", "ar", "nl", "sv", "da", "no", "fi", "pl", "cs", "tr",
-])
-
-function jepubUiLanguage(language: string): string {
-  const base = language.split("-")[0].toLowerCase()
-  return JEPUB_UI_LANGUAGES.has(base) ? base : "en"
-}
-
-/** One chapter's reconstructed content; stored so an EPUB can be re-styled later. */
-export interface Chapter {
-  title: string
-  blocks: Block[]
-}
+// EPUB assembly lives in `epub-book.ts` (no pdf.js), so other front-ends — the
+// Patreon browser extension — can build books without bundling pdf.js. It stays
+// part of this module's public surface.
+export { chaptersToEpub, type Chapter, type EpubMetadata } from "@/lib/epub-book"
 
 /** A file that could not be read at all (corrupt, encrypted, not a PDF). */
 export interface FileFailure {
@@ -242,67 +196,6 @@ export async function pdfToChapters(
     failures,
     emptyChapters: chapters.filter((c) => c.blocks.length === 0).map((c) => c.title),
   }
-}
-
-/**
- * Build a spec-compliant EPUB from already-reconstructed chapters, rendering and
- * styling them with `styler` (defaults to the built-in look). This is the shared
- * path for first conversion and for re-styling from the Style Editor.
- */
-export async function chaptersToEpub(
-  chapters: Chapter[],
-  meta: EpubMetadata,
-  styler: Styler = DEFAULT_STYLER,
-): Promise<Blob> {
-  const language = meta.language || "en"
-  const epub = new jEpub()
-  epub.init({
-    i18n: jepubUiLanguage(language),
-    title: meta.title,
-    author: meta.author,
-    publisher: meta.publisher || "pdf-to-epub",
-    description: meta.description || "",
-  })
-
-  // A stable identifier keeps a re-styled book the *same* book to a device.
-  if (meta.identifier) epub.uuid(meta.identifier)
-  epub.date(new Date())
-
-  if (meta.cover) {
-    // Hand jepub an ArrayBuffer: it then sniffs the format from the magic bytes
-    // instead of trusting `blob.type`, which is empty for some file pickers.
-    const bytes = await meta.cover.arrayBuffer()
-    try {
-      epub.cover(bytes)
-    } catch {
-      // jepub throws bare strings; surface something actionable instead. A
-      // silently dropped cover is exactly what makes Kindle show a book as
-      // "Docs" with a raw filename.
-      throw new Error(
-        "The cover image format isn't supported. Use a JPEG or PNG (JPEG, sRGB, no transparency works best on Kindle).",
-      )
-    }
-  }
-
-  for (const ch of chapters) {
-    const html =
-      ch.blocks.length === 0
-        ? "<p><em>(no extractable text — this PDF may be scanned images)</em></p>"
-        : blocksToHtml(ch.blocks, styler)
-    epub.add(ch.title, html)
-  }
-
-  // jepub references a notes page in its manifest; create it so the EPUB
-  // doesn't point at a missing file (epubcheck RSC-001).
-  epub.notes(`Generated by pdf-to-epub from ${chapters.length} file(s).`)
-
-  const raw = await epub.generate("blob")
-  return normalizeOcf(raw, {
-    css: styler.css,
-    language,
-    series: meta.series,
-    seriesIndex: meta.seriesIndex,
-  })
 }
 
 /**

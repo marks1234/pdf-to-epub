@@ -4,6 +4,7 @@ node_modules/
 # Build output
 dist/
 dist-ssr/
+extensions/patreon-epub/dist/
 *.local
 
 # PWA / Vite generated

@@ -56,8 +56,40 @@ export interface ReconstructedLine {
  */
 export interface Block {
   type: "p" | "li" | "hr"
+  /**
+   * Plain text of the block. Always present: stat-sheet detection, scene-break
+   * detection and de-hyphenation work on it even when {@link Block.runs} is set.
+   */
   text: string
+  /**
+   * Rich inline content, for sources that carry formatting (HTML, e.g. the
+   * Patreon extension). When present it is what renders; `text` must equal the
+   * runs' text joined, with each line break as a single space. PDF
+   * reconstruction never sets it, so PDF output is unchanged.
+   */
+  runs?: InlineRun[]
+  /** Paragraph alignment from the source; rendered as an `align-*` class. */
+  align?: BlockAlign
+  /** Structural role from the source (heading level or block quotation). */
+  role?: BlockRole
 }
+
+/** An inline formatting mark. Rendered as strong / em / u / s respectively. */
+export type InlineMark = "b" | "i" | "u" | "s"
+
+/**
+ * One run of uniformly formatted text, or a line break (`br: true`, `text` is
+ * ignored). Structured data rather than HTML, so rendering escapes every
+ * character and no source markup or attribute can ever reach the book.
+ */
+export interface InlineRun {
+  text: string
+  marks?: InlineMark[]
+  br?: boolean
+}
+
+export type BlockAlign = "center" | "right" | "justify"
+export type BlockRole = "h1" | "h2" | "h3" | "h4" | "blockquote"
 
 // Bullet glyphs that mark a list item. A line beginning with one of these is a
 // hard line boundary (stat blocks / property lists are single-spaced, so a
@@ -351,6 +383,8 @@ function isLabeledFieldBlock(text: string): boolean {
 /** A block that belongs in a stat sheet rather than the prose flow. */
 function isStatLike(b: Block): boolean {
   if (b.type === "hr") return false
+  // Headings and quotations keep their own structure.
+  if (b.role) return false
   if (b.type === "li") return true
   const t = b.text
   return bracketCount(t) >= 2 || /\d%/.test(t) || STAT_LABEL_RE.test(t) || isLabeledFieldBlock(t)
@@ -383,6 +417,45 @@ function renderStatList(items: string[], styler: Styler): string {
   return `<ul class="stat-block">${items.map((t) => `<li>${styler.styleStat(t)}</li>`).join("")}</ul>`
 }
 
+// Canonical nesting order for inline marks, outermost first.
+const MARK_ORDER: InlineMark[] = ["b", "i", "u", "s"]
+const MARK_TAG: Record<InlineMark, string> = { b: "strong", i: "em", u: "u", s: "s" }
+const ALIGNS = new Set<string>(["center", "right", "justify"])
+const HEADINGS = new Set<string>(["h1", "h2", "h3", "h4"])
+
+/**
+ * Render rich runs. `colorize` receives each run's RAW text and must return it
+ * escaped (and optionally colored); it is applied per text segment only, never
+ * across tags or into attributes. Every tag emitted here is a fixed literal.
+ */
+function renderRuns(runs: InlineRun[], colorize: (raw: string) => string): string {
+  let out = ""
+  for (const r of runs) {
+    if (r.br) {
+      out += "<br />"
+      continue
+    }
+    if (!r.text) continue
+    const marks = MARK_ORDER.filter((m) => r.marks?.includes(m))
+    out +=
+      marks.map((m) => `<${MARK_TAG[m]}>`).join("") +
+      colorize(r.text) +
+      [...marks].reverse().map((m) => `</${MARK_TAG[m]}>`).join("")
+  }
+  return out
+}
+
+/** ` class="..."` with an optional base class plus an allowlisted alignment. */
+function classAttr(b: Block, base?: string): string {
+  const classes = [base, b.align && ALIGNS.has(b.align) ? `align-${b.align}` : ""].filter(Boolean)
+  return classes.length ? ` class="${classes.join(" ")}"` : ""
+}
+
+/** Does this block carry any rich-source field? (PDF blocks never do.) */
+function isRich(b: Block): boolean {
+  return b.runs !== undefined || b.align !== undefined || b.role !== undefined
+}
+
 /**
  * Render blocks as chapter HTML using `styler` (defaults to the built-in look).
  *
@@ -396,7 +469,17 @@ function renderStatList(items: string[], styler: Styler): string {
  * Passing a custom styler is how the Style Editor re-renders an EPUB.
  */
 export function blocksToHtml(blocks: Block[], styler: Styler = DEFAULT_STYLER): string {
-  const prose = (text: string) => `<p>${styler.percents(escapeHtml(text))}</p>`
+  const proseInline = (raw: string) => styler.percents(escapeHtml(raw))
+  const statInline = (raw: string) => styler.styleStat(raw)
+  // Inline content of a block: its runs if it has any, else its plain text.
+  const inline = (b: Block, colorize: (raw: string) => string) =>
+    b.runs ? renderRuns(b.runs, colorize) : colorize(b.text)
+  const prose = (text: string) => `<p>${proseInline(text)}</p>`
+  // A prose block from a rich source: alignment class, heading role.
+  const richProse = (b: Block) => {
+    const tag = b.role && HEADINGS.has(b.role) ? b.role : "p"
+    return `<${tag}${classAttr(b)}>${inline(b, proseInline)}</${tag}>`
+  }
   const out: string[] = []
   let i = 0
 
@@ -408,8 +491,18 @@ export function blocksToHtml(blocks: Block[], styler: Styler = DEFAULT_STYLER): 
       i++
       continue
     }
+    if (blocks[i].role === "blockquote") {
+      // Consecutive quoted paragraphs share one <blockquote>.
+      const parts: string[] = []
+      while (i < blocks.length && blocks[i].role === "blockquote" && blocks[i].type !== "hr") {
+        const b = blocks[i++]
+        parts.push(`<p${classAttr(b)}>${inline(b, proseInline)}</p>`)
+      }
+      out.push(`<blockquote>${parts.join("")}</blockquote>`)
+      continue
+    }
     if (!isStatLike(blocks[i])) {
-      out.push(prose(blocks[i].text))
+      out.push(isRich(blocks[i]) ? richProse(blocks[i]) : prose(blocks[i].text))
       i++
       continue
     }
@@ -424,7 +517,15 @@ export function blocksToHtml(blocks: Block[], styler: Styler = DEFAULT_STYLER): 
       // A lone weak stat block: a bullet → a small styled list; a weak
       // paragraph → prose (percentages only) to stay safe.
       const b = run[0]
-      out.push(b.type === "li" ? renderStatList([b.text], styler) : prose(b.text))
+      if (isRich(b)) {
+        out.push(
+          b.type === "li"
+            ? `<ul class="stat-block"><li${classAttr(b)}>${inline(b, statInline)}</li></ul>`
+            : richProse(b),
+        )
+      } else {
+        out.push(b.type === "li" ? renderStatList([b.text], styler) : prose(b.text))
+      }
       continue
     }
 
@@ -432,10 +533,25 @@ export function blocksToHtml(blocks: Block[], styler: Styler = DEFAULT_STYLER): 
     const parts: string[] = []
     let j = 0
     while (j < run.length) {
-      if (run[j].type === "li") {
+      let liEnd = j
+      while (liEnd < run.length && run[liEnd].type === "li") liEnd++
+      if (liEnd > j && run.slice(j, liEnd).some(isRich)) {
+        // Bullets from a rich source keep their inline formatting.
+        const items: string[] = []
+        while (j < run.length && run[j].type === "li") {
+          const b = run[j++]
+          items.push(`<li${classAttr(b)}>${inline(b, statInline)}</li>`)
+        }
+        parts.push(`<ul class="stat-block">${items.join("")}</ul>`)
+      } else if (run[j].type === "li") {
         const items: string[] = []
         while (j < run.length && run[j].type === "li") items.push(run[j++].text)
         parts.push(renderStatList(items, styler))
+      } else if (isRich(run[j])) {
+        // Rich sources already split fields into separate paragraphs / line
+        // breaks, so render the line as-is rather than re-splitting its text.
+        const b = run[j++]
+        parts.push(`<div${classAttr(b, "stat-line")}>${inline(b, statInline)}</div>`)
       } else {
         // Multi-field paragraphs split per "Label: value" entry; other field
         // lines split where extraction glued two fields together.
