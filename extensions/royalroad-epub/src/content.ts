@@ -17,37 +17,40 @@ import {
 } from "./parse"
 
 declare const chrome: {
-  runtime: { sendMessage(msg: unknown): Promise<{ ok: boolean; base64?: string } | undefined> }
+  runtime: {
+    sendMessage(msg: unknown): Promise<
+      { ok: boolean; base64?: string; status?: number; text?: string; cfMitigated?: boolean; retryAfter?: number } | undefined
+    >
+  }
 }
 
 /** Gap between chapter requests; Royal Road rate-limits fast clients. */
-const GAP_MS = 700
+const GAP_MS = 1000
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 class StopError extends Error {}
 
+/** Fetches a Royal Road page via the service worker (see background.ts). */
 async function getHtml(url: string, signal: AbortSignal): Promise<string> {
+  const abs = new URL(url, location.href).href
   for (let attempt = 1; ; attempt++) {
-    let res: Response
-    try {
-      res = await fetch(url, { credentials: "include", signal })
-    } catch (e) {
-      if (signal.aborted) throw new StopError("Cancelled.")
-      if (attempt >= 4) throw e
-      await sleep(3000 * attempt)
+    if (signal.aborted) throw new StopError("Cancelled.")
+    const res = await chrome.runtime.sendMessage({ type: "html", url: abs })
+    if (signal.aborted) throw new StopError("Cancelled.")
+    if (res?.ok && res.text != null) return res.text
+    const status = res?.status ?? 0
+    if (status === 403 && res?.cfMitigated) {
+      throw new StopError(
+        "Royal Road's Cloudflare check blocked the download. Open any chapter in a normal tab, pass the \"are you human\" check if shown, then come back, reload this page and click Start again — chapters already fetched are kept.",
+      )
+    }
+    if ((status === 0 || status === 429 || status >= 500) && attempt < 5) {
+      const after = res?.retryAfter
+      await sleep(after && after > 0 ? Math.min(after, 60) * 1000 : 5000 * attempt)
       continue
     }
-    if (res.ok) return res.text()
-    if (res.status === 403 && res.headers.get("cf-mitigated")) {
-      throw new StopError("Royal Road's Cloudflare check interrupted the download. Reload the page, then click Start again — chapters already fetched are kept.")
-    }
-    if ((res.status === 429 || res.status >= 500) && attempt < 5) {
-      const after = Number(res.headers.get("retry-after"))
-      await sleep(Number.isFinite(after) && after > 0 ? Math.min(after, 60) * 1000 : 5000 * attempt)
-      continue
-    }
-    throw new Error(`HTTP ${res.status}`)
+    throw new Error(`HTTP ${status}`)
   }
 }
 
