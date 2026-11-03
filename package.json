@@ -11,7 +11,8 @@
     "lint": "eslint .",
     "test": "vitest run",
     "build:extension": "vite build -c extensions/patreon-epub/vite.config.ts",
-    "generate-pwa-assets": "pwa-assets-generator"
+    "generate-pwa-assets": "pwa-assets-generator",
+    "build:extension:royalroad": "vite build -c extensions/royalroad-epub/vite.config.ts"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",
