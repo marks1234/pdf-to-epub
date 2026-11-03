@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "Royal Road to EPUB",
+  "version": "0.1.0",
+  "minimum_chrome_version": "116",
+  "description": "Save a Royal Road fiction as one EPUB (with cover and table of contents) for personal offline reading, e.g. on a Kindle.",
+  "permissions": ["cookies"],
+  "host_permissions": ["https://www.royalroad.com/*", "https://*.royalroadcdn.com/*"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": ["https://www.royalroad.com/fiction/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

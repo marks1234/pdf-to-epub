@@ -35,3 +35,4 @@ Thumbs.db
 
 # Claude Code local settings (machine-specific; launch.json is shared)
 .claude/settings.local.json
+extensions/royalroad-epub/dist/
